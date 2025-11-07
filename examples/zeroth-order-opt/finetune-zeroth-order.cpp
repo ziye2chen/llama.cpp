@@ -23,14 +23,15 @@
 
 // Zeroth-order optimization parameters
 struct zeroth_order_params {
-    float epsilon = 1e-3f;              // perturbation size
-    float learning_rate = 1e-7f;        // much smaller than first-order!
-    float weight_decay = 0.1f;         // L2 regularization
-    int32_t n_params_per_iter = 10;     // sample only a few params per iteration
-    int32_t n_elements_per_param = 5;   // sample only a few elements per tensor
+    float epsilon = 1e-3f;              // perturbation size for finite differences
+    float learning_rate = 1e-4f;        // learning rate (smaller than SGD due to noisy gradients)
+    float weight_decay = 0.01f;         // L2 regularization
+    int32_t n_params_per_iter = 3;      // sample only a few params per iteration (each needs forward pass!)
+    int32_t n_elements_per_param = 2;   // sample only a few elements per tensor (each needs forward pass!)
     bool use_random_sampling = true;
     uint32_t random_seed = 42;
     int32_t max_train_tokens = -1;      // if >0, limit dataset to this many tokens (for testing)
+    bool log_gradients = false;         // if true, log gradient estimates (verbose)
 };
 
 // Progress callback for zeroth-order optimization
@@ -114,9 +115,12 @@ static void finetune_zeroth_order(
         const zeroth_order_params & zo_params,
         int n_epochs) {
     
-    LOG_INF("\n%s: starting zeroth-order fine-tuning...\n", __func__);
-    LOG_INF("%s: epsilon=%.2e, lr=%.2e, params_per_iter=%d\n", 
-            __func__, zo_params.epsilon, zo_params.learning_rate, zo_params.n_params_per_iter);
+    LOG_INF("\n%s: starting zeroth-order fine-tuning (REAL gradient estimation)...\n", __func__);
+    LOG_INF("%s: epsilon=%.2e, lr=%.2e, params_per_iter=%d, elements_per_param=%d\n", 
+            __func__, zo_params.epsilon, zo_params.learning_rate, 
+            zo_params.n_params_per_iter, zo_params.n_elements_per_param);
+    LOG_INF("%s: WARNING: This uses REAL forward passes - expect %d forward passes per batch!\n",
+            __func__, zo_params.n_params_per_iter * zo_params.n_elements_per_param + 1);
     
     std::mt19937 rng(zo_params.random_seed);
     
@@ -137,31 +141,23 @@ static void finetune_zeroth_order(
         const int64_t t_epoch_start = ggml_time_us();
         int64_t n_batches = 0;
         float epoch_loss = 0.0f;
-        int current_pos = 0;  // Track position within context window
-        
-        // Clear KV cache at start of epoch
-        llama_memory_clear(llama_get_memory(ctx), true);
         
         // Process training data in batches
         for (size_t i = 0; i + n_batch < train_tokens.size(); i += n_batch) {
-            // Check if we need to reset KV cache (position would exceed context)
-            if (current_pos + n_batch > n_ctx) {
-                llama_memory_clear(llama_get_memory(ctx), true);
-                current_pos = 0;
-                LOG_INF("%s: KV cache cleared at batch %lld (pos reset)\n", __func__, n_batches);
-            }
+            // Clear KV cache at start of each batch for zeroth-order optimization
+            // (We'll be reprocessing the same batch multiple times with perturbed parameters)
+            llama_memory_clear(llama_get_memory(ctx), true);
             
             // Prepare batch
             llama_batch batch = llama_batch_init(n_batch, 0, 1);
             for (int j = 0; j < n_batch && i + j < train_tokens.size(); ++j) {
                 batch.token[j] = train_tokens[i + j];
-                batch.pos[j] = current_pos + j;  // Use position within context window
+                batch.pos[j] = j;  // Position starts from 0 for each batch
                 batch.n_seq_id[j] = 1;
                 batch.seq_id[j][0] = 0;
                 batch.logits[j] = j == n_batch - 1; // only compute logits for last token
             }
             batch.n_tokens = n_batch;
-            current_pos += n_batch;  // Advance position counter
             
             // Forward pass to get baseline loss
             if (llama_decode(ctx, batch) != 0) {
@@ -170,23 +166,23 @@ static void finetune_zeroth_order(
                 continue;
             }
             
-            // Compute loss (simplified - would need actual loss computation)
-            float * logits = llama_get_logits_ith(ctx, batch.n_tokens - 1);
+            // Compute baseline loss
+            float * logits_base = llama_get_logits_ith(ctx, batch.n_tokens - 1);
             const struct llama_model * model_ptr = llama_get_model(ctx);
             int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_ptr));
             
-            // For demo: compute a simple loss metric
-            // In reality, you'd compute cross-entropy against target tokens
+            // Compute loss (L2 norm of logits as a simple metric)
+            // In production, use cross-entropy: -log(softmax(logits)[target_token])
             float loss_base = 0.0f;
-            for (int v = 0; v < std::min(100, n_vocab); ++v) {
-                loss_base += logits[v] * logits[v]; // placeholder loss
+            for (int v = 0; v < std::min(1000, n_vocab); ++v) {
+                loss_base += logits_base[v] * logits_base[v];
             }
             loss_base = std::sqrt(loss_base);
             
             epoch_loss += loss_base;
             n_batches++;
             
-            // Zeroth-order parameter update
+            // Zeroth-order parameter update with REAL gradient estimation
             // Sample a random subset of parameters and update them
             if (params.size() > 0) {
                 std::uniform_int_distribution<size_t> param_dist(0, params.size() - 1);
@@ -217,19 +213,49 @@ static void finetune_zeroth_order(
                         float perturbed_val = current_val + zo_params.epsilon;
                         ggml_backend_tensor_set(param, &perturbed_val, elem_idx * sizeof(float), sizeof(float));
                         
-                        // Recompute loss (simplified - just perturb without full forward pass for demo)
-                        // In a full implementation, you'd do another forward pass here
-                        float loss_perturbed = loss_base + zo_params.epsilon; // placeholder
+                        // *** REAL ZEROTH-ORDER: Do actual forward pass with perturbed parameter ***
+                        llama_synchronize(ctx);  // Ensure backend sees the updated parameter
+                        
+                        // Clear KV cache to allow reprocessing the same batch
+                        // (Without this, llama_decode would expect position to continue from previous decode)
+                        llama_memory_clear(llama_get_memory(ctx), true);
+                        
+                        // Forward pass with perturbed parameter
+                        if (llama_decode(ctx, batch) != 0) {
+                            LOG_ERR("%s: forward pass with perturbation failed, skipping\n", __func__);
+                            // Restore original value
+                            ggml_backend_tensor_set(param, &current_val, elem_idx * sizeof(float), sizeof(float));
+                            // Clear KV cache again before next iteration
+                            llama_memory_clear(llama_get_memory(ctx), true);
+                            continue;
+                        }
+                        
+                        // Compute loss with perturbed parameter
+                        float * logits_perturbed = llama_get_logits_ith(ctx, batch.n_tokens - 1);
+                        float loss_perturbed = 0.0f;
+                        for (int v = 0; v < std::min(1000, n_vocab); ++v) {
+                            loss_perturbed += logits_perturbed[v] * logits_perturbed[v];
+                        }
+                        loss_perturbed = std::sqrt(loss_perturbed);
                         
                         // Estimate gradient via finite difference
                         float estimated_gradient = (loss_perturbed - loss_base) / zo_params.epsilon;
                         
-                        // Update with weight decay
+                        // Optional: Log gradient information
+                        if (zo_params.log_gradients && (e == 0 && p == 0)) {
+                            LOG_INF("  Gradient: loss_base=%.6f, loss_pert=%.6f, grad=%.6e, val=%.6f\n",
+                                    loss_base, loss_perturbed, estimated_gradient, current_val);
+                        }
+                        
+                        // Update with weight decay (L2 regularization)
                         float update = zo_params.learning_rate * (estimated_gradient + zo_params.weight_decay * current_val);
                         float new_val = current_val - update;
                         
                         // Write back updated value
                         ggml_backend_tensor_set(param, &new_val, elem_idx * sizeof(float), sizeof(float));
+                        
+                        // Synchronize again to ensure update is applied
+                        llama_synchronize(ctx);
                     }
                 }
             }
@@ -294,11 +320,16 @@ int main(int argc, char ** argv) {
     
     // Zeroth-order optimization parameters
     zeroth_order_params zo_params;
-    zo_params.epsilon = 1e-2f;
-    zo_params.learning_rate = 1e-1f;
-    zo_params.n_params_per_iter = 10;
-    zo_params.n_elements_per_param = 5;
-    zo_params.max_train_tokens = 6500;  // LIMIT TO 100 TOKENS FOR TESTING (set to -1 for full dataset)
+    zo_params.epsilon = 1e-3f;              // Perturbation size for gradient estimation
+    zo_params.learning_rate = 1e-4f;        // Learning rate (tune based on loss behavior)
+    zo_params.weight_decay = 0.01f;         // L2 regularization to prevent overfitting
+    zo_params.n_params_per_iter = 3;        // Sample 3 parameters per batch (balance speed vs coverage)
+    zo_params.n_elements_per_param = 2;     // Sample 2 elements per parameter (6 forward passes/batch)
+    zo_params.max_train_tokens = 100;       // LIMIT TO 100 TOKENS FOR TESTING (set to -1 for full dataset)
+    zo_params.log_gradients = false;        // Set to true for detailed gradient logging
+    
+    // Note: Total forward passes per batch = 1 (baseline) + n_params_per_iter * n_elements_per_param
+    // Current settings: 1 + 3*2 = 7 forward passes per batch (vs 1 for standard inference)
     
     // Apply token limit if specified
     if (zo_params.max_train_tokens > 0 && train_tokens.size() > (size_t)zo_params.max_train_tokens) {

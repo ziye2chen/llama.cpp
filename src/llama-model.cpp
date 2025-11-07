@@ -20615,6 +20615,28 @@ uint64_t llama_model_n_params(const llama_model * model) {
     return model->n_elements();
 }
 
+size_t llama_model_n_tensors(const llama_model * model) {
+    return model->tensors_by_name.size();
+}
+
+struct ggml_tensor * llama_model_get_tensor_by_index(
+        const struct llama_model * model,
+                        size_t   index,
+                          char * out_name,
+                        size_t   out_name_size) {
+    if (index >= model->tensors_by_name.size()) {
+        return nullptr;
+    }
+    
+    const auto & [name, tensor] = model->tensors_by_name[index];
+    
+    if (out_name != nullptr && out_name_size > 0) {
+        snprintf(out_name, out_name_size, "%s", name.c_str());
+    }
+    
+    return tensor;
+}
+
 bool llama_model_has_encoder(const llama_model * model) {
     switch (model->arch) {
         case LLM_ARCH_T5:        return true;

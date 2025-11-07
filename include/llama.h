@@ -550,6 +550,18 @@ extern "C" {
     // Returns true if the model is diffusion-based (like LLaDA, Dream, etc.)
     LLAMA_API bool llama_model_is_diffusion(const struct llama_model * model);
 
+    // Returns the number of tensors in the model
+    LLAMA_API size_t llama_model_n_tensors(const struct llama_model * model);
+
+    // Get tensor by index (0 to llama_model_n_tensors-1)
+    // Returns NULL if index is out of bounds
+    // out_name should be at least 256 bytes if provided (can be NULL)
+    LLAMA_API struct ggml_tensor * llama_model_get_tensor_by_index(
+            const struct llama_model * model,
+                            size_t   index,
+                              char * out_name,
+                            size_t   out_name_size);
+
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(
             const char * fname_inp,

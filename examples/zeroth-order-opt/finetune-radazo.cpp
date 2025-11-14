@@ -322,7 +322,7 @@ int main(int argc, char ** argv) {
     radazo_config.eps = 1e-8f;                   // Numerical stability
     radazo_config.mu = 5e-2f;                    // Perturbation magnitude
     radazo_config.n_samples = 4;                 // Multiple random samples (key to R-AdaZO!)
-    radazo_config.n_params_per_iter = 1000;         // Parameters per batch
+    radazo_config.n_params_per_iter = 10;         // Parameters per batch
     radazo_config.n_elements_per_param = 10;      // Elements per parameter
     radazo_config.log_gradients = false;         // Set to true for debugging
     

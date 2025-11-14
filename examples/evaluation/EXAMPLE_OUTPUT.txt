@@ -1,0 +1,139 @@
+=====================================
+GSM8K Evaluation - Example Output
+=====================================
+
+This file shows example output from running GSM8K evaluation.
+
+=====================================
+COMMAND
+=====================================
+
+gsm8k-eval.exe -m llama3_2_1b_f32.gguf -f gsm8k_test.jsonl --max-problems 10 -v
+
+=====================================
+VERBOSE OUTPUT (First 2 Problems)
+=====================================
+
+main: Loading GSM8K dataset from gsm8k_test.jsonl
+main: Loaded 10 problems
+main: Loading model from llama3_2_1b_f32.gguf
+main: Model loaded successfully
+
+run_evaluation: Starting GSM8K evaluation...
+run_evaluation: Total problems: 10
+
+[1/10] Accuracy: 100.00% (1/1) | Time: 1.2s | ETA: 10.8s
+
+Problem 1:
+  Question: Janet's ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market?
+  Ground Truth: 18
+  Model Answer: 18
+  Model Output: Janet starts with 16 eggs. She eats 3, so she has 16 - 3 = 13 eggs left. Then she uses 4 for muffins, so she has 13 - 4 = 9 eggs left. She sells these 9 eggs for $2 each, so she makes 9 * 2 = $18.
+  Result: CORRECT ✓
+
+[2/10] Accuracy: 100.00% (2/2) | Time: 2.4s | ETA: 9.6s
+
+Problem 2:
+  Question: A robe takes 2 bolts of blue fiber and half that much white fiber. How many bolts in total does it take?
+  Ground Truth: 3
+  Model Answer: 3
+  Model Output: The robe takes 2 bolts of blue fiber. Half of 2 is 1, so it takes 1 bolt of white fiber. In total, it takes 2 + 1 = 3 bolts.
+  Result: CORRECT ✓
+
+[3/10] Accuracy: 66.67% (2/3) | Time: 3.5s | ETA: 8.2s
+...
+[10/10] Accuracy: 70.00% (7/10) | Time: 12.3s | ETA: 0.0s
+
+=====================================
+FINAL RESULTS
+=====================================
+
+[10/10] Accuracy: 70.00% (7/10) | Time: 12.3s | ETA: 0.0s
+
+=====================================
+GSM8K Evaluation Results
+=====================================
+Model: llama3_2_1b_f32.gguf
+Dataset: gsm8k_test.jsonl
+Total problems: 10
+Correct: 7
+Incorrect: 3
+Accuracy: 70.00%
+Total time: 12.34 seconds
+Average time per problem: 1.23 seconds
+=====================================
+
+=====================================
+FULL DATASET OUTPUT (Non-verbose)
+=====================================
+
+Command: gsm8k-eval.exe -m llama3_2_1b_f32.gguf -f gsm8k_test.jsonl
+
+main: Loading GSM8K dataset from gsm8k_test.jsonl
+main: Loaded 1319 problems
+main: Loading model from llama3_2_1b_f32.gguf
+main: Model loaded successfully
+
+run_evaluation: Starting GSM8K evaluation...
+run_evaluation: Total problems: 1319
+
+[10/1319] Accuracy: 60.00% (6/10) | Time: 9.3s | ETA: 1223.7s
+[20/1319] Accuracy: 55.00% (11/20) | Time: 18.7s | ETA: 1215.4s
+[30/1319] Accuracy: 53.33% (16/30) | Time: 28.1s | ETA: 1207.8s
+[40/1319] Accuracy: 52.50% (21/40) | Time: 37.4s | ETA: 1197.9s
+[50/1319] Accuracy: 54.00% (27/50) | Time: 46.8s | ETA: 1188.3s
+[100/1319] Accuracy: 51.00% (51/100) | Time: 93.2s | ETA: 1136.6s
+[200/1319] Accuracy: 49.50% (99/200) | Time: 186.5s | ETA: 1043.8s
+[300/1319] Accuracy: 48.67% (146/300) | Time: 279.8s | ETA: 950.9s
+[400/1319] Accuracy: 47.75% (191/400) | Time: 373.1s | ETA: 857.9s
+[500/1319] Accuracy: 47.20% (236/500) | Time: 466.4s | ETA: 765.0s
+[600/1319] Accuracy: 46.83% (281/600) | Time: 559.7s | ETA: 671.9s
+[700/1319] Accuracy: 46.43% (325/700) | Time: 653.0s | ETA: 578.8s
+[800/1319] Accuracy: 46.13% (369/800) | Time: 746.3s | ETA: 485.7s
+[900/1319] Accuracy: 45.89% (413/900) | Time: 839.6s | ETA: 392.6s
+[1000/1319] Accuracy: 45.70% (457/1000) | Time: 932.9s | ETA: 297.6s
+[1100/1319] Accuracy: 45.55% (501/1100) | Time: 1026.2s | ETA: 204.7s
+[1200/1319] Accuracy: 45.42% (545/1200) | Time: 1119.5s | ETA: 111.7s
+[1300/1319] Accuracy: 45.31% (589/1300) | Time: 1212.8s | ETA: 17.7s
+[1319/1319] Accuracy: 45.26% (597/1319) | Time: 1230.5s | ETA: 0.0s
+
+=====================================
+GSM8K Evaluation Results
+=====================================
+Model: llama3_2_1b_f32.gguf
+Dataset: gsm8k_test.jsonl
+Total problems: 1319
+Correct: 597
+Incorrect: 722
+Accuracy: 45.26%
+Total time: 1230.56 seconds
+Average time per problem: 0.93 seconds
+=====================================
+
+=====================================
+INTERPRETATION
+=====================================
+
+45.26% accuracy on GSM8K for a 1B model is actually quite good!
+
+Typical results:
+- 1-3B models (base): 5-15%
+- 1-3B models (instruction-tuned): 15-30%
+- 7B models: 20-40%
+- 13B models: 30-50%
+- 70B models: 50-70%
+- GPT-4 level: 85-95%
+
+The model correctly solved 597 out of 1,319 problems.
+Common failure modes for smaller models:
+1. Multi-step reasoning errors
+2. Arithmetic mistakes with large numbers
+3. Misunderstanding complex word problems
+4. Getting lost in long reasoning chains
+
+To improve performance:
+1. Use a larger model
+2. Fine-tune on math problems (see examples/zeroth-order-opt/)
+3. Adjust prompting strategy
+4. Use chain-of-thought prompting
+

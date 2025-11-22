@@ -182,11 +182,9 @@ static void finetune_radazo(
             epoch_loss += batch_loss;
             n_batches++;
             
-            // Progress reporting
-            if (n_batches % 10 == 0) {
-                progress_callback_radazo(true, n_batches, 
-                    train_tokens.size() / n_batch, epoch_loss / n_batches, t_epoch_start);
-            }
+            // Progress reporting (print every iteration)
+            progress_callback_radazo(true, n_batches, 
+                train_tokens.size() / n_batch, epoch_loss / n_batches, t_epoch_start);
             
             llama_batch_free(batch);
         }
@@ -210,7 +208,7 @@ int main(int argc, char ** argv) {
     params.escape = false;
     
     // Set defaults suitable for R-AdaZO
-    params.n_batch = 64;
+    params.n_batch = 16;
     params.n_ctx = 512;
     
     // Default GSM8K dataset path (try multiple locations)
@@ -322,8 +320,8 @@ int main(int argc, char ** argv) {
     radazo_config.eps = 1e-8f;                   // Numerical stability
     radazo_config.mu = 5e-2f;                    // Perturbation magnitude
     radazo_config.n_samples = 4;                 // Multiple random samples (key to R-AdaZO!)
-    radazo_config.n_params_per_iter = 10;         // Parameters per batch
-    radazo_config.n_elements_per_param = 10;      // Elements per parameter
+    radazo_config.n_params_per_iter = 10;        // Parameters per batch
+    radazo_config.full_tensor_gradient = true;   // Update entire tensor each step
     radazo_config.log_gradients = false;         // Set to true for debugging
     
     LOG_INF("%s: R-AdaZO Configuration:\n", __func__);
@@ -333,8 +331,9 @@ int main(int argc, char ** argv) {
     LOG_INF("%s:   mu = %.2e (perturbation magnitude)\n", __func__, radazo_config.mu);
     LOG_INF("%s:   n_samples = %d (multiple perturbations per gradient!)\n", __func__, radazo_config.n_samples);
     LOG_INF("%s:   n_params_per_iter = %d\n", __func__, radazo_config.n_params_per_iter);
-    LOG_INF("%s:   n_elements_per_param = %d\n", __func__, radazo_config.n_elements_per_param);
-    LOG_INF("%s:   Forward passes per element = %d (n_samples)\n\n", __func__, radazo_config.n_samples);
+    LOG_INF("%s:   full_tensor_gradient = %s (entire tensor updates)\n", __func__,
+            radazo_config.full_tensor_gradient ? "true" : "false");
+    LOG_INF("%s:   Forward passes per parameter = %d (n_samples)\n\n", __func__, radazo_config.n_samples);
     
     LOG_INF("%s: Key R-AdaZO Features:\n", __func__);
     LOG_INF("%s:   - Adam-style adaptive learning rate\n", __func__);

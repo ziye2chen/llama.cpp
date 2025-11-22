@@ -137,7 +137,7 @@ struct radazo_params {
     float mu;                        // Perturbation magnitude (default: 5e-3)
     int32_t n_samples;               // Samples per gradient (default: 2)
     int32_t n_params_per_iter;       // Parameters per batch (default: 3)
-    int32_t n_elements_per_param;    // Elements per parameter (default: 2)
+    bool full_tensor_gradient;       // Perturb/update entire tensor (default: true)
     bool log_gradients;              // Verbose logging (default: false)
 };
 ```
@@ -175,12 +175,12 @@ struct radazo_params {
 
 Total forward passes per batch:
 ```
-FP = 1 (baseline) + n_params_per_iter × n_elements_per_param × n_samples
+FP = 1 (baseline) + n_params_per_iter × n_samples
 ```
 
-Example with defaults (3 params, 2 elements, 2 samples):
+Example with defaults (3 params, 2 samples):
 ```
-FP = 1 + 3 × 2 × 2 = 13 forward passes per batch
+FP = 1 + 3 × 2 = 7 forward passes per batch
 ```
 
 ## Performance Characteristics
@@ -188,8 +188,8 @@ FP = 1 + 3 × 2 × 2 = 13 forward passes per batch
 ### Computational Cost
 
 - **Basic ZO**: ~7x slower than inference (1 baseline + 6 perturbed forward passes)
-- **R-AdaZO (n_samples=2)**: ~13x slower (1 baseline + 12 perturbed forward passes)
-- **Trade-off**: More forward passes, but better convergence → fewer total epochs needed
+- **R-AdaZO (n_samples=2)**: ~7x slower (1 baseline + 6 perturbed forward passes, but each pass perturbs an entire tensor)
+- **Trade-off**: Same number of passes, but better gradient quality → fewer total epochs needed
 
 ### Memory Usage
 
@@ -210,27 +210,41 @@ Empirical results (from paper):
 
 ### Gradient Estimation
 
-For each element, we generate `n_samples` random perturbations:
+For each tensor, we now generate `n_samples` random **full-length** perturbations:
 
 ```cpp
+const int64_t n_elements = ggml_nelements(param);
+std::vector<float> base(n_elements);
+ggml_backend_tensor_get(param, base.data(), 0, n_elements * sizeof(float));
+
+std::vector<float> grad(n_elements, 0.0f);
+std::vector<float> perturbed(n_elements);
+
 for (int s = 0; s < n_samples; ++s) {
-    // Generate normalized random direction
-    float direction = random_sign();  // +1 or -1 for scalars
+    auto direction = get_perturbation(n_elements, rng_()); // unit vector
     
-    // Perturb: x + μu
-    float perturbed_val = current_val + mu * direction;
-    set_parameter(param, perturbed_val);
+    for (int64_t i = 0; i < n_elements; ++i) {
+        perturbed[i] = base[i] + mu * direction[i];
+    }
+    ggml_backend_tensor_set(param, perturbed.data(), 0, n_elements * sizeof(float));
+    llama_synchronize(ctx);
     
-    // Forward pass
+    llama_memory_clear(llama_get_memory(ctx), true);
+    llama_decode(ctx, batch);
+    
     float loss_plus = compute_loss();
+    float scale = (loss_plus - loss_base) / mu;
+    for (int64_t i = 0; i < n_elements; ++i) {
+        grad[i] += scale * direction[i];
+    }
     
-    // Gradient estimate: (f(x+μu) - f(x)) * u / μ
-    float grad_sample = (loss_plus - loss_base) * direction / mu;
-    
-    gradient += grad_sample;
+    ggml_backend_tensor_set(param, base.data(), 0, n_elements * sizeof(float));
+    llama_synchronize(ctx);
 }
 
-gradient /= n_samples;  // Average
+for (float & g : grad) {
+    g /= n_samples;
+}
 ```
 
 ### Adam-Style Update
@@ -324,7 +338,7 @@ RAdaZOOptimizer(
 | **SGD** | 1 | Low | Fast | Standard training |
 | **Adam** | 1 | Medium | Fast | Standard training |
 | **Basic ZO** | 7 | Minimal | Slow | Inference-only frameworks |
-| **R-AdaZO** | 13 | Low-Medium | Medium | Better ZO with adaptive rates |
+| **R-AdaZO** | 7 | Low-Medium | Medium | Better ZO with adaptive rates |
 
 ## Example Output
 

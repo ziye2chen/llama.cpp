@@ -20,7 +20,7 @@ struct radazo_params {
     float mu = 5e-3f;                    // smoothing parameter (perturbation magnitude)
     int32_t n_samples = 2;               // number of random samples per gradient estimation
     int32_t n_params_per_iter = 3;       // parameters to sample per iteration
-    int32_t n_elements_per_param = 2;    // elements to update per parameter
+    bool full_tensor_gradient = true;    // if true, estimate gradient for entire tensor
     uint32_t random_seed = 42;
     bool log_gradients = false;          // verbose gradient logging
 };
@@ -59,20 +59,21 @@ private:
     std::vector<float> get_perturbation(int64_t n_elements, uint32_t seed);
     
     // Estimate gradient using multiple samples
-    float estimate_gradient_radazo(
+    void estimate_tensor_gradient_radazo(
         struct llama_context * ctx,
         llama_batch & batch,
         struct ggml_tensor * param,
-        int64_t elem_idx,
         float loss_base,
         int n_vocab,
-        std::vector<float> & grad_est);
+        std::vector<float> & grad_est,
+        std::vector<float> & param_snapshot);
     
     // Update parameter using Adam-style adaptive learning rate
     void update_parameter_adam(
+        struct llama_context * ctx,
         struct ggml_tensor * param,
-        int64_t elem_idx,
-        float gradient);
+        const std::vector<float> & gradient,
+        const std::vector<float> & param_snapshot);
     
     // Get or create state for a parameter
     radazo_param_state & get_state(struct ggml_tensor * param);

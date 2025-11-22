@@ -28,7 +28,7 @@ This document compares the two zeroth-order optimizers implemented in `llama.cpp
 | **Memory Usage** | Minimal | 2x parameters (m + v) |
 | **Convergence Speed** | Slow | Faster (2-5x improvement) |
 | **Hyperparameter Tuning** | Simple | More complex |
-| **Computational Cost** | ~7x inference | ~13x inference (n_samples=2) |
+| **Computational Cost** | ~7x inference | ~7x inference (n_samples=2, full-tensor updates) |
 
 ## Algorithm Details
 
@@ -75,14 +75,14 @@ For each parameter θ:
 
 ### Computational Cost
 
-| Optimizer | FP per Element | FP per Batch* | Relative Speed |
+| Optimizer | FP per Parameter | FP per Batch* | Relative Speed |
 |-----------|----------------|---------------|----------------|
 | **Inference** | 1 | 1 | 1.0x (baseline) |
 | **Basic ZO** | 2 | 7 | 0.14x (7x slower) |
-| **R-AdaZO (n=2)** | 3 | 13 | 0.08x (13x slower) |
-| **R-AdaZO (n=5)** | 6 | 31 | 0.03x (31x slower) |
+| **R-AdaZO (n=2)** | 3 | 7 | 0.14x (full tensors, better gradients) |
+| **R-AdaZO (n=5)** | 6 | 16 | 0.06x (more samples) |
 
-*Assuming 3 params/batch, 2 elements/param
+*Assuming 3 params/batch
 
 ### Convergence Comparison
 
@@ -172,7 +172,7 @@ config.beta2 = 0.999f;               // Second moment decay
 config.mu = 5e-3f;                   // Perturbation size
 config.n_samples = 2;                // Samples per gradient (key!)
 config.n_params_per_iter = 3;        // Params per batch
-config.n_elements_per_param = 2;     // Elements per param
+config.full_tensor_gradient = true;  // Perturb/update entire tensor
 ```
 
 **Tuning Priority**:
@@ -299,7 +299,7 @@ Despite R-AdaZO being slower per epoch, it converges in fewer epochs → less to
 |--------|----------|---------|---------|
 | **Convergence Speed** | Slow | Fast | R-AdaZO (2-5x) |
 | **Memory Usage** | Minimal | Low | Basic ZO |
-| **Computational Cost** | 7x inference | 13x inference | Basic ZO |
+| **Computational Cost** | 7x inference | 7x inference | Tie (full-tensor updates) |
 | **Implementation Complexity** | Simple | Moderate | Basic ZO |
 | **Hyperparameter Tuning** | Easy | Moderate | Basic ZO |
 | **Final Loss Quality** | Good | Better | R-AdaZO |

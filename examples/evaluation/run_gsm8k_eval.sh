@@ -56,3 +56,8 @@ echo ""
 # Run the evaluation
 "${EXE_PATH}" -m "${MODEL_PATH}" -f "${DATASET_PATH}" ${MAX_FLAG}
 
+
+
+
+
+

@@ -256,7 +256,7 @@ struct radazo_params {
     float mu = 5e-3f;                   // Perturbation magnitude (μ)
     int32_t n_samples = 2;              // Number of samples per gradient (q)
     int32_t n_params_per_iter = 3;      // Parameters to update per batch
-    int32_t n_elements_per_param = 2;   // Elements per parameter
+    bool full_tensor_gradient = true;   // Perturb & update entire tensor
     uint32_t random_seed = 42;
     bool log_gradients = false;
 };
@@ -304,6 +304,12 @@ float RAdaZOOptimizer::step(
     llama_batch & batch,
     int n_vocab) {
     
+    if (trainable_params_.empty()) {
+        return 0.0f;
+    }
+    
+    global_step++;
+    
     // STEP 1: Compute baseline loss (no perturbation)
     float * logits_base = llama_get_logits_ith(ctx, batch.n_tokens - 1);
     float loss_base = compute_loss(logits_base, n_vocab);
@@ -316,96 +322,27 @@ float RAdaZOOptimizer::step(
     for (int32_t p = 0; p < params_.n_params_per_iter; ++p) {
         size_t param_idx = param_dist(rng_);
         struct ggml_tensor * param = trainable_params_[param_idx];
-        
-        // Get/initialize state for this parameter
-        ParamState & state = param_states_[param];
-        if (state.m.empty()) {
-            state.m.resize(n_elements, 0.0f);
-            state.v.resize(n_elements, 0.0f);
+        const int64_t n_elements = ggml_nelements(param);
+        if (n_elements == 0) {
+            continue;
         }
         
-        // STEP 4: For each element in this parameter
-        std::uniform_int_distribution<int64_t> elem_dist(0, n_elements - 1);
-        std::vector<float> u_buffer(n_elements);
+        // STEP 4: Estimate gradient for the entire tensor via multiple perturbations
+        std::vector<float> grad_est;
+        std::vector<float> param_snapshot;
+        estimate_tensor_gradient_radazo(
+            ctx, batch, param, loss_base, n_vocab, grad_est, param_snapshot);
         
-        for (int32_t e = 0; e < params_.n_elements_per_param; ++e) {
-            int64_t elem_idx = elem_dist(rng_);
-            
-            // Read current value
-            float current_val = 0.0f;
-            ggml_backend_tensor_get(param, &current_val, 
-                                   elem_idx * sizeof(float), sizeof(float));
-            
-            // STEP 5: Estimate gradient with multiple samples
-            float estimated_gradient_sum = 0.0f;
-            
-            for (int s = 0; s < params_.n_samples; ++s) {
-                // Generate random perturbation
-                get_perturbation(u_buffer.data(), n_elements, 
-                               params_.random_seed + global_step + p + e + s);
-                float u_val = u_buffer[elem_idx];
-                
-                // Perturb parameter: θ + μ·u
-                float perturbed_val = current_val + params_.mu * u_val;
-                ggml_backend_tensor_set(param, &perturbed_val, 
-                                       elem_idx * sizeof(float), sizeof(float));
-                
-                // Clear KV cache and synchronize
-                llama_synchronize(ctx);
-                llama_memory_clear(llama_get_memory(ctx), true);
-                
-                // Forward pass with perturbed parameter
-                if (llama_decode(ctx, batch) != 0) {
-                    // Restore on error
-                    ggml_backend_tensor_set(param, &current_val, 
-                                          elem_idx * sizeof(float), sizeof(float));
-                    llama_memory_clear(llama_get_memory(ctx), true);
-                    continue;
-                }
-                forward_passes_++;
-                
-                // Compute perturbed loss
-                float * logits_perturbed = llama_get_logits_ith(ctx, batch.n_tokens - 1);
-                float loss_perturbed = compute_loss(logits_perturbed, n_vocab);
-                
-                // Gradient estimate for this sample: ∇̂ = (L(θ+μu) - L(θ)) * u / μ
-                float gradient_sample = (loss_perturbed - loss_base) * u_val / params_.mu;
-                estimated_gradient_sum += gradient_sample;
-                
-                // Restore original value
-                ggml_backend_tensor_set(param, &current_val, 
-                                       elem_idx * sizeof(float), sizeof(float));
-                llama_synchronize(ctx);
-            }
-            
-            // STEP 6: Average gradient estimate
-            float estimated_gradient = estimated_gradient_sum / params_.n_samples;
-            
-            // STEP 7: Update first moment (momentum)
-            state.m[elem_idx] = params_.beta1 * state.m[elem_idx] + 
-                               (1.0f - params_.beta1) * estimated_gradient;
-            
-            // STEP 8: Update second moment (R-AdaZO innovation!)
-            state.v[elem_idx] = params_.beta2 * state.v[elem_idx] + 
-                               (1.0f - params_.beta2) * state.m[elem_idx] * state.m[elem_idx];
-            
-            // STEP 9: Bias correction
-            float m_hat = state.m[elem_idx] / (1.0f - std::pow(params_.beta1, global_step));
-            float v_hat = state.v[elem_idx] / (1.0f - std::pow(params_.beta2, global_step));
-            
-            // STEP 10: Adaptive parameter update
-            float update = params_.lr * m_hat / (std::sqrt(v_hat) + params_.eps);
-            float new_val = current_val - update;
-            
-            // STEP 11: Write updated parameter
-            ggml_backend_tensor_set(param, &new_val, 
-                                   elem_idx * sizeof(float), sizeof(float));
-            llama_synchronize(ctx);
-            total_updates_++;
+        if (grad_est.empty()) {
+            continue;
         }
+        
+        // STEP 5: Apply Adam-style adaptive update to all elements
+        update_parameter_adam(param, grad_est, param_snapshot);
+        
+        total_updates_ += n_elements;
     }
     
-    global_step++;
     return loss_base;
 }
 ```
@@ -526,7 +463,7 @@ config.beta2 = 0.999f;
 config.mu = 5e-3f;
 config.n_samples = 2;
 config.n_params_per_iter = 3;
-config.n_elements_per_param = 2;
+config.full_tensor_gradient = true;
 
 // 4. Create optimizer
 RAdaZOOptimizer optimizer(config, trainable_params);
@@ -582,7 +519,7 @@ cmake --build . --config Debug --target finetune-radazo
 | `mu` | `1e-3` to `1e-2` | Perturbation size |
 | `n_samples` | `2` to `10` | More = lower variance, slower |
 | `n_params_per_iter` | `1` to `20` | More = better coverage, slower |
-| `n_elements_per_param` | `1` to `10` | More = more updates, slower |
+| `full_tensor_gradient` | `true` | Perturb and update entire tensor |
 
 **Quick Tuning Tips:**
 1. Start with defaults
@@ -615,10 +552,10 @@ Basic ZO:
   = 1 + 3 × 2 = 7 passes
 
 R-AdaZO:
-  = 1 (baseline) + n_params_per_iter × n_elements_per_param × n_samples
-  = 1 + 3 × 2 × 2 = 13 passes
+  = 1 (baseline) + n_params_per_iter × n_samples   // full-tensor perturbations
+  = 1 + 3 × 2 = 7 passes
 
-Ratio: 13/7 ≈ 1.86x more expensive per batch
+Ratio: 7/7 = 1.0x per batch (but each perturbation touches the entire tensor)
 ```
 
 **But:** R-AdaZO converges 2-3x faster, so **total cost is lower!**
@@ -745,7 +682,7 @@ Where `T` is number of iterations, matching first-order methods!
 **Optimizations:**
 1. Decrease `n_samples` from 2 to 1 (faster but noisier)
 2. Decrease `n_params_per_iter` from 3 to 1
-3. Decrease `n_elements_per_param` from 2 to 1
+3. Reduce the list of trainable tensors (e.g., skip some FFN weights)
 4. Use quantized model (Q4_K_M instead of F32)
 
 ### Out of Memory

@@ -411,3 +411,8 @@ This architecture is designed to be:
 - **Extensible**: Easy to add new features
 - **Portable**: Works on Windows, Linux, Mac
 
+
+
+
+
+

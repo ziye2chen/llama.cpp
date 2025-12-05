@@ -18,11 +18,125 @@
 #include <fstream>
 #include <sstream>
 
+// Platform-specific headers for CPU and memory monitoring
+#if defined(_WIN32)
+    #include <windows.h>
+    #include <psapi.h>
+    #pragma comment(lib, "psapi.lib")
+#elif defined(__linux__)
+    #include <unistd.h>
+    #include <sys/resource.h>
+    #include <fstream>
+#elif defined(__APPLE__)
+    #include <unistd.h>
+    #include <sys/resource.h>
+    #include <mach/mach.h>
+#endif
+
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267)  // possible loss of data
 #endif
 
 using json = nlohmann::json;
+
+// ========================================
+// System Resource Monitoring
+// ========================================
+
+// Get current process memory usage in MB
+static float get_memory_usage_mb() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS_EX pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
+        return pmc.WorkingSetSize / (1024.0f * 1024.0f);  // Convert bytes to MB
+    }
+    return 0.0f;
+#elif defined(__linux__)
+    // Read from /proc/self/status
+    std::ifstream status_file("/proc/self/status");
+    std::string line;
+    while (std::getline(status_file, line)) {
+        if (line.substr(0, 6) == "VmRSS:") {
+            std::istringstream iss(line.substr(6));
+            float mem_kb;
+            iss >> mem_kb;
+            return mem_kb / 1024.0f;  // Convert KB to MB
+        }
+    }
+    return 0.0f;
+#elif defined(__APPLE__)
+    struct mach_task_basic_info info;
+    mach_msg_type_number_t info_count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &info_count) == KERN_SUCCESS) {
+        return info.resident_size / (1024.0f * 1024.0f);  // Convert bytes to MB
+    }
+    return 0.0f;
+#else
+    return 0.0f;
+#endif
+}
+
+// Get CPU usage percentage (approximate, based on time slice)
+struct cpu_usage_tracker {
+    int64_t last_time_us;
+    int64_t last_cpu_time_us;
+    
+    cpu_usage_tracker() : last_time_us(0), last_cpu_time_us(0) {}
+    
+    float get_cpu_usage() {
+#if defined(_WIN32)
+        FILETIME create_time, exit_time, kernel_time, user_time;
+        if (GetProcessTimes(GetCurrentProcess(), &create_time, &exit_time, &kernel_time, &user_time)) {
+            int64_t now_us = ggml_time_us();
+            
+            // Convert FILETIME to microseconds (100-nanosecond intervals)
+            int64_t cpu_time_us = ((int64_t)user_time.dwHighDateTime << 32 | user_time.dwLowDateTime) / 10;
+            cpu_time_us += ((int64_t)kernel_time.dwHighDateTime << 32 | kernel_time.dwLowDateTime) / 10;
+            
+            if (last_time_us > 0) {
+                int64_t elapsed_us = now_us - last_time_us;
+                int64_t cpu_elapsed_us = cpu_time_us - last_cpu_time_us;
+                
+                if (elapsed_us > 0) {
+                    float cpu_percent = (100.0f * cpu_elapsed_us) / elapsed_us;
+                    last_time_us = now_us;
+                    last_cpu_time_us = cpu_time_us;
+                    return cpu_percent;
+                }
+            }
+            
+            last_time_us = now_us;
+            last_cpu_time_us = cpu_time_us;
+        }
+        return 0.0f;
+#elif defined(__linux__) || defined(__APPLE__)
+        struct rusage usage;
+        if (getrusage(RUSAGE_SELF, &usage) == 0) {
+            int64_t now_us = ggml_time_us();
+            int64_t cpu_time_us = usage.ru_utime.tv_sec * 1000000LL + usage.ru_utime.tv_usec;
+            cpu_time_us += usage.ru_stime.tv_sec * 1000000LL + usage.ru_stime.tv_usec;
+            
+            if (last_time_us > 0) {
+                int64_t elapsed_us = now_us - last_time_us;
+                int64_t cpu_elapsed_us = cpu_time_us - last_cpu_time_us;
+                
+                if (elapsed_us > 0) {
+                    float cpu_percent = (100.0f * cpu_elapsed_us) / elapsed_us;
+                    last_time_us = now_us;
+                    last_cpu_time_us = cpu_time_us;
+                    return cpu_percent;
+                }
+            }
+            
+            last_time_us = now_us;
+            last_cpu_time_us = cpu_time_us;
+        }
+        return 0.0f;
+#else
+        return 0.0f;
+#endif
+    }
+};
 
 // Training configuration
 struct training_config {
@@ -110,20 +224,27 @@ static std::vector<llama_token> gsm8k_to_tokens(
     return all_tokens;
 }
 
-// Progress callback
+// Progress callback (with CPU and memory monitoring)
 static void progress_callback_radazo(
         bool train,
         int64_t iter,
         int64_t iter_max,
         float loss,
-        int64_t t_start_us) {
+        int64_t t_start_us,
+        cpu_usage_tracker & cpu_tracker) {
     const int64_t t_now_us = ggml_time_us();
     const float elapsed = (t_now_us - t_start_us) / 1.0e6f;
     
-    fprintf(stderr, "\r[%s] Iter %6lld/%6lld | Loss: %.6f | Time: %6.2fs | %.1f it/s",
+    // Get system resource usage
+    float memory_mb = get_memory_usage_mb();
+    float cpu_percent = cpu_tracker.get_cpu_usage();
+    
+    fprintf(stderr, "\r[%s] Iter %6lld/%6lld | Loss: %.6f | Time: %6.2fs | %.1f it/s | CPU: %5.1f%% | Mem: %7.1f MB",
             train ? "TRAIN" : "EVAL ",
             iter, iter_max, loss, elapsed,
-            iter > 0 ? iter / elapsed : 0.0f);
+            iter > 0 ? iter / elapsed : 0.0f,
+            cpu_percent,
+            memory_mb);
     fflush(stderr);
 }
 
@@ -144,6 +265,9 @@ static void finetune_radazo(
     
     LOG_INF("%s: n_ctx=%d, n_batch=%d, n_train_tokens=%zu, n_epochs=%d\n",
             __func__, n_ctx, n_batch, train_tokens.size(), n_epochs);
+    
+    // Initialize CPU usage tracker for monitoring
+    cpu_usage_tracker cpu_tracker;
     
     // Training loop
     for (int epoch = 0; epoch < n_epochs; ++epoch) {
@@ -184,7 +308,7 @@ static void finetune_radazo(
             
             // Progress reporting (print every iteration)
             progress_callback_radazo(true, n_batches, 
-                train_tokens.size() / n_batch, epoch_loss / n_batches, t_epoch_start);
+                train_tokens.size() / n_batch, epoch_loss / n_batches, t_epoch_start, cpu_tracker);
             
             llama_batch_free(batch);
         }
@@ -200,6 +324,12 @@ static void finetune_radazo(
     LOG_INF("%s:   Total forward passes: %lld\n", __func__, optimizer.get_forward_passes());
     LOG_INF("%s:   Average forward passes per update: %.2f\n", __func__, 
             (float)optimizer.get_forward_passes() / optimizer.get_total_updates());
+    
+    // Print final resource usage
+    LOG_INF("\n%s: Final Resource Usage:\n", __func__);
+    LOG_INF("%s:   Memory: %.1f MB\n", __func__, get_memory_usage_mb());
+    LOG_INF("%s:   CPU: %.1f%%\n", __func__, cpu_tracker.get_cpu_usage());
+    
     LOG_INF("\n%s: fine-tuning complete!\n", __func__);
 }
 
@@ -208,7 +338,7 @@ int main(int argc, char ** argv) {
     params.escape = false;
     
     // Set defaults suitable for R-AdaZO
-    params.n_batch = 16;
+    params.n_batch = 4;
     params.n_ctx = 512;
     
     // Default GSM8K dataset path (try multiple locations)
@@ -314,15 +444,15 @@ int main(int argc, char ** argv) {
     
     // Step 2: Configure R-AdaZO parameters
     radazo_params radazo_config;
-    radazo_config.lr = 1e-2f;                    // Learning rate (R-AdaZO can use higher than basic ZO)
+    radazo_config.lr = 1e-3f;                    // Learning rate (R-AdaZO can use higher than basic ZO)
     radazo_config.beta1 = 0.9f;                  // First moment decay (momentum)
     radazo_config.beta2 = 0.999f;                // Second moment decay
     radazo_config.eps = 1e-8f;                   // Numerical stability
-    radazo_config.mu = 5e-2f;                    // Perturbation magnitude
+    radazo_config.mu = 5e-3f;                    // Perturbation magnitude
     radazo_config.n_samples = 4;                 // Multiple random samples (key to R-AdaZO!)
     radazo_config.n_params_per_iter = 10;        // Parameters per batch
     radazo_config.full_tensor_gradient = true;   // Update entire tensor each step
-    radazo_config.log_gradients = false;         // Set to true for debugging
+    radazo_config.log_gradients = true;         // Set to true for debugging
     
     LOG_INF("%s: R-AdaZO Configuration:\n", __func__);
     LOG_INF("%s:   lr = %.2e (learning rate)\n", __func__, radazo_config.lr);

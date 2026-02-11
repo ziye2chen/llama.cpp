@@ -191,7 +191,7 @@ std::vector<struct ggml_tensor *> collect_trainable_parameters(
             // Log first 10 and last 5 parameters
             if (verbose) {
                 if (params.size() <= 10 || params.size() > n_tensors - 5) {
-                    LOG_INF("%s:   [%3zu] %s (shape: [%lld, %lld], %lld elements)\n",
+                    LOG_INF("%s:   [%3zu] %s (shape: [%ld, %ld], %ld elements)\n",
                             __func__, params.size(), tensor_name,
                             tensor->ne[0], tensor->ne[1], ggml_nelements(tensor));
                 } else if (params.size() == 11) {

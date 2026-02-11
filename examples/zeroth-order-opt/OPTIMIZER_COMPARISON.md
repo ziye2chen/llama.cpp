@@ -201,7 +201,7 @@ for (each batch) {
 }
 
 // Statistics
-printf("Updates: %lld, FP: %lld\n",
+printf("Updates: %ld, FP: %ld\n",
        optimizer.get_total_updates(),
        optimizer.get_forward_passes());
 ```
@@ -225,7 +225,7 @@ for (each batch) {
 }
 
 // Statistics
-printf("Updates: %lld, FP: %lld, Avg FP/update: %.2f\n",
+printf("Updates: %ld, FP: %ld, Avg FP/update: %.2f\n",
        optimizer.get_total_updates(),
        optimizer.get_forward_passes(),
        (float)optimizer.get_forward_passes() / optimizer.get_total_updates());

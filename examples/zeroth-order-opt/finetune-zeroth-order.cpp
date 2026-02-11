@@ -28,7 +28,7 @@ static void progress_callback_zeroth_order(
     const int64_t t_now_us = ggml_time_us();
     const float elapsed = (t_now_us - t_start_us) / 1.0e6f;
     
-    fprintf(stderr, "\r[%s] Iter %6lld/%6lld | Loss: %.6f | Time: %6.2fs | %.1f it/s",
+    fprintf(stderr, "\r[%s] Iter %6ld/%6ld | Loss: %.6f | Time: %6.2fs | %.1f it/s",
             train ? "TRAIN" : "EVAL ",
             iter, iter_max, loss, elapsed,
             iter > 0 ? iter / elapsed : 0.0f);
@@ -111,8 +111,8 @@ static void finetune_zeroth_order(
     
     // Print optimizer statistics
     LOG_INF("\n%s: Optimizer Statistics:\n", __func__);
-    LOG_INF("%s:   Total parameter updates: %lld\n", __func__, optimizer.get_total_updates());
-    LOG_INF("%s:   Total forward passes: %lld\n", __func__, optimizer.get_forward_passes());
+    LOG_INF("%s:   Total parameter updates: %ld\n", __func__, optimizer.get_total_updates());
+    LOG_INF("%s:   Total forward passes: %ld\n", __func__, optimizer.get_forward_passes());
     LOG_INF("\n%s: fine-tuning complete!\n", __func__);
 }
 

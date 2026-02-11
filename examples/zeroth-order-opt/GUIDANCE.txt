@@ -1,0 +1,9 @@
+cd llama.cpp
+mkdir build
+cd build 
+cmake .. -DGGML_CUDA=ON
+cmake --build . --config Debug --target finetune-radazo
+
+./bin/finetune-radazo   -m /home/xplor/llama.cpp/Qwen3-8B-f32.gguf  -o /home/xplor/llama.cpp/Qwen3-8B-f32-finetuned_2.gguf -b 32 -c 1024  --epochs 1 --learning_rate 0.0001
+
+./bin/llama-perplexity -m /home/xplor/llama.cpp/Qwen3-8B-f32-finetuned_2.gguf -f /home/xplor/llama.cpp/examples/zeroth-order-opt/wiki.test.raw

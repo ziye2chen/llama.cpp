@@ -266,7 +266,7 @@ float RAdaZOOptimizer::step(
             }
             grad_norm = std::sqrt(grad_norm);
             
-            LOG_INF("  [R-AdaZO] Step %lld: loss_base=%.6f, ||grad||=%.6e, elems=%lld\n",
+            LOG_INF("  [R-AdaZO] Step %ld: loss_base=%.6f, ||grad||=%.6e, elems=%ld\n",
                     global_step, loss_base, grad_norm, n_elements);
         }
     }
@@ -323,7 +323,7 @@ std::vector<struct ggml_tensor *> collect_trainable_parameters_radazo(
             // Log first 10 and last 5 parameters
             if (verbose) {
                 if (params.size() <= 10 || params.size() > n_tensors - 5) {
-                    LOG_INF("%s:   [%3zu] %s (shape: [%lld, %lld], %lld elements)\n",
+                    LOG_INF("%s:   [%3zu] %s (shape: [%ld, %ld], %ld elements)\n",
                             __func__, params.size(), tensor_name,
                             tensor->ne[0], tensor->ne[1], ggml_nelements(tensor));
                 } else if (params.size() == 11) {

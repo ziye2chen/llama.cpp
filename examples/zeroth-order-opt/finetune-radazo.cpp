@@ -239,7 +239,7 @@ static void progress_callback_radazo(
     float memory_mb = get_memory_usage_mb();
     float cpu_percent = cpu_tracker.get_cpu_usage();
     
-    fprintf(stderr, "\r[%s] Iter %6lld/%6lld | Loss: %.6f | Time: %6.2fs | %.1f it/s | CPU: %5.1f%% | Mem: %7.1f MB",
+    fprintf(stderr, "\r[%s] Iter %6ld/%6ld | Loss: %.6f | Time: %6.2fs | %.1f it/s | CPU: %5.1f%% | Mem: %7.1f MB",
             train ? "TRAIN" : "EVAL ",
             iter, iter_max, loss, elapsed,
             iter > 0 ? iter / elapsed : 0.0f,
@@ -320,8 +320,8 @@ static void finetune_radazo(
     
     // Print optimizer statistics
     LOG_INF("\n%s: R-AdaZO Optimizer Statistics:\n", __func__);
-    LOG_INF("%s:   Total parameter updates: %lld\n", __func__, optimizer.get_total_updates());
-    LOG_INF("%s:   Total forward passes: %lld\n", __func__, optimizer.get_forward_passes());
+    LOG_INF("%s:   Total parameter updates: %ld\n", __func__, optimizer.get_total_updates());
+    LOG_INF("%s:   Total forward passes: %ld\n", __func__, optimizer.get_forward_passes());
     LOG_INF("%s:   Average forward passes per update: %.2f\n", __func__, 
             (float)optimizer.get_forward_passes() / optimizer.get_total_updates());
     
@@ -444,7 +444,7 @@ int main(int argc, char ** argv) {
     
     // Step 2: Configure R-AdaZO parameters
     radazo_params radazo_config;
-    radazo_config.lr = 1e-3f;                    // Learning rate (R-AdaZO can use higher than basic ZO)
+    radazo_config.lr = 1e-4f;                    // Learning rate (R-AdaZO can use higher than basic ZO)
     radazo_config.beta1 = 0.9f;                  // First moment decay (momentum)
     radazo_config.beta2 = 0.999f;                // Second moment decay
     radazo_config.eps = 1e-8f;                   // Numerical stability

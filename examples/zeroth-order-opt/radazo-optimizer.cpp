@@ -1,5 +1,6 @@
 // R-AdaZO Optimizer Implementation
 // Based on "Refining Adaptive Zeroth-Order Optimization at Ease" (arXiv:2502.01014)
+// Supports both FP32 and quantized (Q4_K_M, Q8_0, etc.) tensor types
 
 #include "radazo-optimizer.h"
 #include "log.h"
@@ -9,6 +10,62 @@
 #include <algorithm>
 #include <string>
 #include <numeric>
+
+// ========================================
+// Quantized tensor helper functions
+// ========================================
+
+// Dequantize a full tensor from its raw quantized bytes into FP32
+static bool dequantize_tensor_to_fp32(
+    struct ggml_tensor * param,
+    const std::vector<uint8_t> & quant_bytes,
+    std::vector<float> & fp32_out) {
+
+    const enum ggml_type qtype = param->type;
+    const struct ggml_type_traits * traits = ggml_get_type_traits(qtype);
+    if (traits == nullptr || traits->to_float == nullptr) {
+        return false;
+    }
+
+    const int64_t nrows     = ggml_nrows(param);
+    const int64_t n_per_row = param->ne[0];
+    const size_t  row_size  = ggml_row_size(qtype, n_per_row);
+
+    fp32_out.resize(ggml_nelements(param));
+
+    for (int64_t r = 0; r < nrows; ++r) {
+        const void * src = quant_bytes.data() + r * row_size;
+        float      * dst = fp32_out.data()    + r * n_per_row;
+        traits->to_float(src, dst, n_per_row);
+    }
+    return true;
+}
+
+// Requantize FP32 values back into raw quantized bytes
+static bool requantize_fp32_to_bytes(
+    struct ggml_tensor * param,
+    const std::vector<float> & fp32_in,
+    std::vector<uint8_t> & quant_out) {
+
+    const enum ggml_type qtype = param->type;
+    const struct ggml_type_traits * traits = ggml_get_type_traits(qtype);
+    if (traits == nullptr || traits->from_float_ref == nullptr) {
+        return false;
+    }
+
+    const int64_t nrows     = ggml_nrows(param);
+    const int64_t n_per_row = param->ne[0];
+    const size_t  row_size  = ggml_row_size(qtype, n_per_row);
+
+    quant_out.resize(ggml_nbytes(param));
+
+    for (int64_t r = 0; r < nrows; ++r) {
+        const float * src = fp32_in.data()    + r * n_per_row;
+        void        * dst = quant_out.data()  + r * row_size;
+        traits->from_float_ref(src, dst, n_per_row);
+    }
+    return true;
+}
 
 // Constructor
 RAdaZOOptimizer::RAdaZOOptimizer(
@@ -83,6 +140,7 @@ radazo_param_state & RAdaZOOptimizer::get_state(struct ggml_tensor * param) {
 }
 
 // Estimate gradient for the entire tensor using R-AdaZO method
+// Supports both FP32 and quantized tensor types transparently
 void RAdaZOOptimizer::estimate_tensor_gradient_radazo(
     struct llama_context * ctx,
     llama_batch & batch,
@@ -102,9 +160,32 @@ void RAdaZOOptimizer::estimate_tensor_gradient_radazo(
     grad_est.assign(n_elements, 0.0f);
     param_snapshot.resize(n_elements);
     
-    // Capture the current tensor values so we can restore after perturbations
-    ggml_backend_tensor_get(param, param_snapshot.data(), 0, n_elements * sizeof(float));
-    llama_synchronize(ctx);
+    const bool is_quant = ggml_is_quantized(param->type);
+    
+    // Raw quantized bytes — only used when the tensor is quantized
+    std::vector<uint8_t> quant_snapshot;
+    
+    if (is_quant) {
+        // ---- Quantized path ----
+        // 1. Save original raw quantized bytes (for exact restoration)
+        const size_t nbytes = ggml_nbytes(param);
+        quant_snapshot.resize(nbytes);
+        ggml_backend_tensor_get(param, quant_snapshot.data(), 0, nbytes);
+        llama_synchronize(ctx);
+        
+        // 2. Dequantize to FP32 for perturbation arithmetic
+        if (!dequantize_tensor_to_fp32(param, quant_snapshot, param_snapshot)) {
+            LOG_ERR("%s: failed to dequantize tensor %s (type %s)\n",
+                    __func__, ggml_get_name(param), ggml_type_name(param->type));
+            grad_est.clear();
+            param_snapshot.clear();
+            return;
+        }
+    } else {
+        // ---- FP32 path ----
+        ggml_backend_tensor_get(param, param_snapshot.data(), 0, n_elements * sizeof(float));
+        llama_synchronize(ctx);
+    }
     
     std::vector<float> perturbed_values(n_elements);
     
@@ -113,12 +194,23 @@ void RAdaZOOptimizer::estimate_tensor_gradient_radazo(
         // Generate a normalized random direction for the full tensor
         auto direction = get_perturbation(n_elements, rng_());
         
-        // Apply perturbation: x + mu * u
+        // Apply perturbation in FP32 space: x + mu * u
         for (int64_t i = 0; i < n_elements; ++i) {
             perturbed_values[i] = param_snapshot[i] + params_.mu * direction[i];
         }
         
-        ggml_backend_tensor_set(param, perturbed_values.data(), 0, n_elements * sizeof(float));
+        // Write perturbed values back into the tensor
+        if (is_quant) {
+            // Re-quantize perturbed FP32 values and set raw bytes
+            std::vector<uint8_t> quant_perturbed;
+            if (!requantize_fp32_to_bytes(param, perturbed_values, quant_perturbed)) {
+                LOG_ERR("%s: failed to requantize perturbed tensor\n", __func__);
+                continue;
+            }
+            ggml_backend_tensor_set(param, quant_perturbed.data(), 0, quant_perturbed.size());
+        } else {
+            ggml_backend_tensor_set(param, perturbed_values.data(), 0, n_elements * sizeof(float));
+        }
         llama_synchronize(ctx);
         
         // Clear KV cache and do forward pass with perturbed parameter
@@ -126,7 +218,12 @@ void RAdaZOOptimizer::estimate_tensor_gradient_radazo(
         
         if (llama_decode(ctx, batch) != 0) {
             LOG_ERR("%s: llama_decode failed during tensor perturbation, restoring parameter\n", __func__);
-            ggml_backend_tensor_set(param, param_snapshot.data(), 0, n_elements * sizeof(float));
+            // Restore original
+            if (is_quant) {
+                ggml_backend_tensor_set(param, quant_snapshot.data(), 0, quant_snapshot.size());
+            } else {
+                ggml_backend_tensor_set(param, param_snapshot.data(), 0, n_elements * sizeof(float));
+            }
             llama_synchronize(ctx);
             llama_memory_clear(llama_get_memory(ctx), true);
             continue;
@@ -145,7 +242,11 @@ void RAdaZOOptimizer::estimate_tensor_gradient_radazo(
         }
         
         // Restore original parameter values before next sample
-        ggml_backend_tensor_set(param, param_snapshot.data(), 0, n_elements * sizeof(float));
+        if (is_quant) {
+            ggml_backend_tensor_set(param, quant_snapshot.data(), 0, quant_snapshot.size());
+        } else {
+            ggml_backend_tensor_set(param, param_snapshot.data(), 0, n_elements * sizeof(float));
+        }
         llama_synchronize(ctx);
     }
     
@@ -158,6 +259,7 @@ void RAdaZOOptimizer::estimate_tensor_gradient_radazo(
 }
 
 // Update parameter using Adam-style adaptive learning rate (R-AdaZO variant)
+// Supports both FP32 and quantized tensor types transparently
 void RAdaZOOptimizer::update_parameter_adam(
     struct llama_context * ctx,
     struct ggml_tensor * param,
@@ -199,7 +301,20 @@ void RAdaZOOptimizer::update_parameter_adam(
         new_values[i] = param_snapshot[i] - update;
     }
     
-    ggml_backend_tensor_set(param, new_values.data(), 0, n_elements * sizeof(float));
+    const bool is_quant = ggml_is_quantized(param->type);
+    
+    if (is_quant) {
+        // Re-quantize the updated FP32 values back into the quantized format
+        std::vector<uint8_t> quant_updated;
+        if (!requantize_fp32_to_bytes(param, new_values, quant_updated)) {
+            LOG_ERR("%s: failed to requantize updated tensor %s\n",
+                    __func__, ggml_get_name(param));
+            return;
+        }
+        ggml_backend_tensor_set(param, quant_updated.data(), 0, quant_updated.size());
+    } else {
+        ggml_backend_tensor_set(param, new_values.data(), 0, n_elements * sizeof(float));
+    }
     llama_synchronize(ctx);
     
     total_updates += n_elements;
@@ -323,9 +438,10 @@ std::vector<struct ggml_tensor *> collect_trainable_parameters_radazo(
             // Log first 10 and last 5 parameters
             if (verbose) {
                 if (params.size() <= 10 || params.size() > n_tensors - 5) {
-                    LOG_INF("%s:   [%3zu] %s (shape: [%ld, %ld], %ld elements)\n",
+                    LOG_INF("%s:   [%3zu] %s (shape: [%ld, %ld], %ld elements, type: %s)\n",
                             __func__, params.size(), tensor_name,
-                            tensor->ne[0], tensor->ne[1], ggml_nelements(tensor));
+                            tensor->ne[0], tensor->ne[1], ggml_nelements(tensor),
+                            ggml_type_name(tensor->type));
                 } else if (params.size() == 11) {
                     LOG_INF("%s:   ... (showing first/last only)\n", __func__);
                 }

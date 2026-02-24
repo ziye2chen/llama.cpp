@@ -1,3 +1,20 @@
+在 Jetson / Ubuntu 上，最常用的是直接装 build-essential：
+```
+sudo apt update
+sudo apt install build-essential
+```
+装完后确认：
+```
+which g++
+g++ --version
+```
+若能看到类似 /usr/bin/g++ 和版本号，再回到 build 目录重新跑：
+
+```
+
+
+
+
 cd llama.cpp
 mkdir build
 cd build 
@@ -7,3 +24,20 @@ cmake --build . --config Debug --target finetune-radazo
 ./bin/finetune-radazo   -m /home/xplor/llama.cpp/Qwen3-8B-f32.gguf  -o /home/xplor/llama.cpp/Qwen3-8B-f32-finetuned_2.gguf -b 32 -c 1024  --epochs 1 --learning_rate 0.0001
 
 ./bin/llama-perplexity -m /home/xplor/llama.cpp/Qwen3-8B-f32-finetuned_2.gguf -f /home/xplor/llama.cpp/examples/zeroth-order-opt/wiki.test.raw
+
+
+/home/xplor/.cache/huggingface/hub/models--Qwen--Qwen3-8B-GGUF/snapshots/7c41481f57cb95916b40956ab2f0b139b296d974/Qwen3-8B-Q4_K_M.gguf
+
+./bin/finetune-radazo-quant   -m /home/xplor/.cache/huggingface/hub/models--Qwen--Qwen3-8B-GGUF/snapshots/7c41481f57cb95916b40956ab2f0b139b296d974/Qwen3-8B-Q4_K_M.gguf   -f /home/xplor/llama.cpp/examples/zeroth-order-opt/gsm8k_test.jsonl   -o /home/xplor/llama.cpp/Qwen3_Q4_K_M_finetuned.gguf  --epochs 1
+
+# Verify parameter update (test that tensor modifications persist to saved GGUF):
+# Replace MODEL.gguf with your actual model path, e.g.:
+./bin/verify-param-update -m /home/xplor/.cache/huggingface/hub/models--Qwen--Qwen3-8B-GGUF/snapshots/7c41481f57cb95916b40956ab2f0b139b296d974/Qwen3-8B-Q4_K_M.gguf -o model_modified.gguf
+# Then compare perplexity - modified model should differ:
+./bin/llama-perplexity -m /home/xplor/.cache/huggingface/hub/models--Qwen--Qwen3-8B-GGUF/snapshots/7c41481f57cb95916b40956ab2f0b139b296d974/Qwen3-8B-Q4_K_M.gguf -f /home/xplor/llama.cpp/examples/zeroth-order-opt/wiki.test.raw
+./bin/llama-perplexity -m model_modified.gguf -f /home/xplor/llama.cpp/examples/zeroth-order-opt/wiki.test.raw
+
+# Original vs finetuned Qwen3-8B-Q4_K_M:
+./bin/llama-perplexity -m /home/xplor/.cache/huggingface/hub/models--Qwen--Qwen3-8B-GGUF/snapshots/7c41481f57cb95916b40956ab2f0b139b296d974/Qwen3-8B-Q4_K_M.gguf -f /home/xplor/llama.cpp/examples/zeroth-order-opt/wiki.test.raw
+
+./bin/llama-perplexity -m /home/xplor/llama.cpp/Qwen3_Q4_K_M_finetuned.gguf -f /home/xplor/llama.cpp/examples/zeroth-order-opt/wiki.test.raw

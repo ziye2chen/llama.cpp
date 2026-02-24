@@ -1,6 +1,9 @@
-// R-AdaZO Optimizer for GGUF Models
+// R-AdaZO Optimizer for GGUF Models (FP32 and Quantized)
 // Refining Adaptive Zeroth-Order Optimization
 // Paper: "Refining Adaptive Zeroth-Order Optimization at Ease" (arXiv:2502.01014)
+//
+// This optimizer transparently handles both FP32 and quantized (Q4_K_M, Q8_0, etc.)
+// tensors by dequantizing before perturbation and requantizing after updates.
 
 #pragma once
 
@@ -33,6 +36,7 @@ struct radazo_param_state {
 };
 
 // R-AdaZO optimizer class
+// Works with both FP32 and quantized model tensors
 class RAdaZOOptimizer {
 public:
     // Constructor
@@ -58,7 +62,7 @@ private:
     // Generate normalized random perturbation
     std::vector<float> get_perturbation(int64_t n_elements, uint32_t seed);
     
-    // Estimate gradient using multiple samples
+    // Estimate gradient using multiple samples (handles FP32 and quantized)
     void estimate_tensor_gradient_radazo(
         struct llama_context * ctx,
         llama_batch & batch,
@@ -68,7 +72,7 @@ private:
         std::vector<float> & grad_est,
         std::vector<float> & param_snapshot);
     
-    // Update parameter using Adam-style adaptive learning rate
+    // Update parameter using Adam-style adaptive learning rate (handles FP32 and quantized)
     void update_parameter_adam(
         struct llama_context * ctx,
         struct ggml_tensor * param,
@@ -95,8 +99,7 @@ private:
 };
 
 // Helper function: Collect trainable parameters from model
-// (Same as zeroth-order-optimizer.h, included for completeness)
+// Works with both FP32 and quantized models
 std::vector<struct ggml_tensor *> collect_trainable_parameters_radazo(
     struct llama_context * ctx,
     bool verbose = true);
-

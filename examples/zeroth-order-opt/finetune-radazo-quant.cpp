@@ -8,6 +8,7 @@
 #include "log.h"
 #include "llama.h"
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "radazo-optimizer.h"
 #include "json.hpp"
 
@@ -18,6 +19,7 @@
 #include <vector>
 #include <fstream>
 #include <sstream>
+#include <iomanip>
 
 // Platform-specific headers for CPU and memory monitoring
 #if defined(_WIN32)
@@ -39,6 +41,7 @@
 #endif
 
 using json = nlohmann::json;
+static constexpr const char * k_memory_log_path = "memory.txt";
 
 // ========================================
 // System Resource Monitoring
@@ -74,6 +77,77 @@ static float get_memory_usage_mb() {
 #else
     return 0.0f;
 #endif
+}
+
+static bool get_gpu_memory_usage_mb(float & gpu_used_mb, float & gpu_free_mb, float & gpu_total_mb) {
+    gpu_used_mb = 0.0f;
+    gpu_free_mb = 0.0f;
+    gpu_total_mb = 0.0f;
+
+    const size_t n_devs = ggml_backend_dev_count();
+    for (size_t i = 0; i < n_devs; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const enum ggml_backend_dev_type dev_type = ggml_backend_dev_type(dev);
+        if (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+            dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+        if (total_bytes == 0) {
+            continue;
+        }
+
+        gpu_free_mb += (float) free_bytes / (1024.0f * 1024.0f);
+        gpu_total_mb += (float) total_bytes / (1024.0f * 1024.0f);
+    }
+
+    if (gpu_total_mb > 0.0f) {
+        gpu_used_mb = gpu_total_mb - gpu_free_mb;
+        return true;
+    }
+
+    return false;
+}
+
+static void append_memory_log_train(
+        const char * stage,
+        int epoch,
+        int64_t iter,
+        int32_t batch_tokens,
+        const char * extra = nullptr) {
+    const float cpu_mb = get_memory_usage_mb();
+    float gpu_used_mb = 0.0f, gpu_free_mb = 0.0f, gpu_total_mb = 0.0f;
+    const bool has_gpu = get_gpu_memory_usage_mb(gpu_used_mb, gpu_free_mb, gpu_total_mb);
+
+    std::ofstream fout(k_memory_log_path, std::ios::app);
+    if (!fout.is_open()) {
+        return;
+    }
+
+    fout << std::fixed << std::setprecision(2)
+         << "scope=train"
+         << " epoch=" << epoch
+         << " iter=" << iter
+         << " stage=" << stage
+         << " batch_tokens=" << batch_tokens
+         << " cpu_mb=" << cpu_mb;
+
+    if (has_gpu) {
+        fout << " gpu_used_mb=" << gpu_used_mb
+             << " gpu_free_mb=" << gpu_free_mb
+             << " gpu_total_mb=" << gpu_total_mb;
+    } else {
+        fout << " gpu=unavailable";
+    }
+
+    if (extra != nullptr && extra[0] != '\0') {
+        fout << " extra=" << extra;
+    }
+
+    fout << "\n";
 }
 
 // CPU usage tracker
@@ -266,6 +340,7 @@ static void finetune_radazo_quant(
     // Training loop
     for (int epoch = 0; epoch < n_epochs; ++epoch) {
         LOG_INF("\n%s: ===== Epoch %d/%d =====\n", __func__, epoch + 1, n_epochs);
+        append_memory_log_train("epoch_begin", epoch + 1, 0, 0);
 
         const int64_t t_epoch_start = ggml_time_us();
         int64_t n_batches = 0;
@@ -273,8 +348,12 @@ static void finetune_radazo_quant(
 
         // Process training data in batches
         for (size_t i = 0; i + n_batch < train_tokens.size(); i += n_batch) {
+            const llama_token target_token = train_tokens[i + n_batch];
+            append_memory_log_train("batch_begin", epoch + 1, n_batches + 1, n_batch);
+
             // Clear KV cache at start of each batch
             llama_memory_clear(llama_get_memory(ctx), true);
+            append_memory_log_train("after_kv_clear", epoch + 1, n_batches + 1, n_batch);
 
             // Prepare batch
             llama_batch batch = llama_batch_init(n_batch, 0, 1);
@@ -293,11 +372,13 @@ static void finetune_radazo_quant(
                 llama_batch_free(batch);
                 continue;
             }
+            append_memory_log_train("after_baseline_decode", epoch + 1, n_batches + 1, n_batch);
 
             // *** R-AdaZO optimizer step ***
             // The optimizer handles quantized tensors transparently:
             // dequantize -> perturb in FP32 -> requantize -> forward -> restore -> Adam update
-            float batch_loss = optimizer.step(ctx, batch, n_vocab);
+            float batch_loss = optimizer.step(ctx, batch, n_vocab, target_token);
+            append_memory_log_train("after_optimizer_step", epoch + 1, n_batches + 1, n_batch);
 
             epoch_loss += batch_loss;
             n_batches++;
@@ -307,11 +388,13 @@ static void finetune_radazo_quant(
                 train_tokens.size() / n_batch, epoch_loss / n_batches, t_epoch_start, cpu_tracker);
 
             llama_batch_free(batch);
+            append_memory_log_train("after_batch_free", epoch + 1, n_batches, n_batch);
         }
 
         fprintf(stderr, "\n");
         LOG_INF("%s: Epoch %d complete - Avg Loss: %.6f\n",
                 __func__, epoch + 1, epoch_loss / n_batches);
+        append_memory_log_train("epoch_end", epoch + 1, n_batches, n_batch);
     }
 
     // Print optimizer statistics
@@ -339,7 +422,7 @@ int main(int argc, char ** argv) {
     params.escape = false;
 
     // Set defaults suitable for R-AdaZO
-    params.n_batch = 4;
+    params.n_batch = 8;
     params.n_ctx = 512;
 
     // Default GSM8K dataset path (try multiple locations)
@@ -367,6 +450,20 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Reset memory profiling log file as early as possible so startup baselines are kept.
+    {
+        std::ofstream fout(k_memory_log_path, std::ios::trunc);
+        if (fout.is_open()) {
+            fout << "# memory profile log\n";
+            fout << "# fields: scope epoch iter step stage param_idx sample_idx batch_tokens cpu_mb gpu_used_mb gpu_free_mb gpu_total_mb extra\n";
+        } else {
+            LOG_ERR("%s: failed to open %s for memory logging\n", __func__, k_memory_log_path);
+        }
+    }
+
+    // Baseline before backend/model initialization.
+    append_memory_log_train("baseline_before_backend_init", 0, 0, 0);
+
     // Force settings for optimization (required for in-place tensor updates)
     if (params.use_mmap) {
         LOG_INF("%s: disabling memory mapping for weight updates\n", __func__);
@@ -376,11 +473,14 @@ int main(int argc, char ** argv) {
     common_init();
     llama_backend_init();
     llama_numa_init(params.numa);
+    append_memory_log_train("baseline_after_backend_init", 0, 0, 0);
 
     // Load model and context
+    append_memory_log_train("baseline_before_model_load", 0, 0, 0);
     common_init_result llama_init = common_init_from_params(params);
     llama_model_ptr & model = llama_init.model;
     llama_context_ptr & ctx = llama_init.context;
+    append_memory_log_train("baseline_after_model_load", 0, 0, 0);
 
     if (model == NULL) {
         LOG_ERR("%s: unable to load model\n", __func__);
@@ -470,21 +570,27 @@ int main(int argc, char ** argv) {
     radazo_config.beta2 = 0.999f;
     radazo_config.eps = 1e-8f;
     radazo_config.mu = 5e-3f;
-    radazo_config.n_samples = 4;
-    radazo_config.n_params_per_iter = 10;
+    // Faster default profile: still performs R-AdaZO, but with fewer perturbation passes.
+    // This is critical for large quantized tensors where dequant/requant dominates runtime.
+    radazo_config.n_samples = 1;
+    radazo_config.n_params_per_iter = 2;
     radazo_config.full_tensor_gradient = true;
-    radazo_config.log_gradients = true;
+    radazo_config.log_gradients = false;
 
     LOG_INF("%s: R-AdaZO Configuration:\n", __func__);
     LOG_INF("%s:   lr = %.2e (learning rate)\n", __func__, radazo_config.lr);
     LOG_INF("%s:   beta1 = %.3f (first moment decay)\n", __func__, radazo_config.beta1);
     LOG_INF("%s:   beta2 = %.3f (second moment decay)\n", __func__, radazo_config.beta2);
     LOG_INF("%s:   mu = %.2e (perturbation magnitude)\n", __func__, radazo_config.mu);
-    LOG_INF("%s:   n_samples = %d (multiple perturbations per gradient!)\n", __func__, radazo_config.n_samples);
+    LOG_INF("%s:   n_samples = %d (multiple perturbations per gradient)\n", __func__, radazo_config.n_samples);
     LOG_INF("%s:   n_params_per_iter = %d\n", __func__, radazo_config.n_params_per_iter);
     LOG_INF("%s:   full_tensor_gradient = %s\n", __func__,
             radazo_config.full_tensor_gradient ? "true" : "false");
-    LOG_INF("%s:   Forward passes per parameter = %d (n_samples)\n\n", __func__, radazo_config.n_samples);
+    LOG_INF("%s:   Approx forward passes per batch = 1 + %d * %d = %d\n\n",
+            __func__,
+            radazo_config.n_params_per_iter,
+            radazo_config.n_samples,
+            1 + radazo_config.n_params_per_iter * radazo_config.n_samples);
 
     // Create the R-AdaZO optimizer with the model's actual tensors
     RAdaZOOptimizer optimizer(radazo_config, trainable_params);

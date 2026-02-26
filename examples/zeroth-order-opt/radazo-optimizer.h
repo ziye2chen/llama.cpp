@@ -13,6 +13,7 @@
 #include <vector>
 #include <random>
 #include <unordered_map>
+#include <string>
 
 // R-AdaZO optimization parameters
 struct radazo_params {
@@ -49,7 +50,8 @@ public:
     float step(
         struct llama_context * ctx,
         llama_batch & batch,
-        int n_vocab);
+        int n_vocab,
+        llama_token target_token = -1);
     
     // Get statistics
     int64_t get_total_updates() const { return total_updates; }
@@ -57,10 +59,13 @@ public:
     
 private:
     // Compute loss from logits
-    float compute_loss(float * logits, int n_vocab);
+    float compute_loss(float * logits, int n_vocab, llama_token target_token);
     
-    // Generate normalized random perturbation
-    std::vector<float> get_perturbation(int64_t n_elements, uint32_t seed);
+    // Fill a normalized random perturbation (unit norm) in-place
+    void fill_perturbation(
+        std::vector<float> & out,
+        int64_t n_elements,
+        uint32_t seed);
     
     // Estimate gradient using multiple samples (handles FP32 and quantized)
     void estimate_tensor_gradient_radazo(
@@ -69,18 +74,27 @@ private:
         struct ggml_tensor * param,
         float loss_base,
         int n_vocab,
-        std::vector<float> & grad_est,
-        std::vector<float> & param_snapshot);
+        llama_token target_token,
+        std::vector<float> & grad_est);
     
     // Update parameter using Adam-style adaptive learning rate (handles FP32 and quantized)
     void update_parameter_adam(
         struct llama_context * ctx,
         struct ggml_tensor * param,
-        const std::vector<float> & gradient,
-        const std::vector<float> & param_snapshot);
+        const std::vector<float> & gradient);
     
     // Get or create state for a parameter
     radazo_param_state & get_state(struct ggml_tensor * param);
+
+    // Drop large intermediate buffers once a parameter step finishes.
+    void clear_intermediate_buffers();
+
+    // Append CPU/GPU memory usage for each optimizer stage.
+    void log_memory_checkpoint(
+        const char * stage,
+        int32_t param_idx = -1,
+        int32_t sample_idx = -1,
+        const char * extra = nullptr);
     
     // Parameters
     radazo_params params_;
@@ -88,6 +102,16 @@ private:
     
     // Per-parameter state (maps tensor pointer to state)
     std::unordered_map<struct ggml_tensor *, radazo_param_state> param_states_;
+
+    // Reused scratch buffers to reduce allocation churn and peak RSS.
+    std::vector<float> scratch_grad_est_;
+    std::vector<float> scratch_param_snapshot_;
+    std::vector<float> scratch_perturbed_values_;
+    std::vector<float> scratch_direction_;
+    std::vector<float> scratch_new_values_;
+    std::vector<uint8_t> scratch_quant_snapshot_;
+    std::vector<uint8_t> scratch_quant_perturbed_;
+    std::vector<uint8_t> scratch_quant_updated_;
     
     // Random number generator
     std::mt19937 rng_;

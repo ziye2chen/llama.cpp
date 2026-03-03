@@ -11,7 +11,40 @@ g++ --version
 若能看到类似 /usr/bin/g++ 和版本号，再回到 build 目录重新跑：
 
 ```
+pip install cmake
+sudo apt update
+sudo apt install build-essential
+nvcc --version
+conda install -c nvidia cuda-toolkit=13.0
+ls /etc/apt/sources.list.d | grep -i cuda || echo "no cuda list"
+sudo tee /etc/apt/sources.list.d/cuda-ubuntu2204-x86_64.list >/dev/null <<'EOF'
+deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/ /
+EOF
 
+sudo apt update
+
+apt-cache search cuda-toolkit-13
+
+sudo apt install cuda-toolkit-13-0
+
+apt-cache search nvcc
+
+sudo apt install cuda-nvcc-13-0
+
+dpkg -L cuda-nvcc-13-0 | grep '/nvcc$'
+
+export PATH=/usr/local/cuda-13.0/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:${LD_LIBRARY_PATH:-}
+
+nvcc --version
+
+echo 'export PATH=/usr/local/cuda-13.0/bin:$PATH' >> ~/.bashrc
+echo 'export LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:${LD_LIBRARY_PATH:-}' >> ~/.bashrc
+
+sudo apt update
+sudo apt install -y libcurl4-openssl-dev
+
+source ~/.bashrc
 
 
 
@@ -19,7 +52,7 @@ cd llama.cpp
 mkdir build
 cd build 
 cmake .. -DGGML_CUDA=ON
-cmake --build . --config Debug --target finetune-radazo
+cmake --build . --config Debug --target finetune-radazo-quant
 
 ./bin/finetune-radazo   -m /home/xplor/llama.cpp/Qwen3-8B-f32.gguf  -o /home/xplor/llama.cpp/Qwen3-8B-f32-finetuned_2.gguf -b 32 -c 1024  --epochs 1 --learning_rate 0.0001
 
@@ -41,3 +74,15 @@ cmake --build . --config Debug --target finetune-radazo
 ./bin/llama-perplexity -m /home/xplor/.cache/huggingface/hub/models--Qwen--Qwen3-8B-GGUF/snapshots/7c41481f57cb95916b40956ab2f0b139b296d974/Qwen3-8B-Q4_K_M.gguf -f /home/xplor/llama.cpp/examples/zeroth-order-opt/wiki.test.raw
 
 ./bin/llama-perplexity -m /home/xplor/llama.cpp/Qwen3_Q4_K_M_finetuned.gguf -f /home/xplor/llama.cpp/examples/zeroth-order-opt/wiki.test.raw
+
+./bin/finetune-radazo-quant   -m /root/.cache/huggingface/hub/models--Qwen--Qwen3-8B-GGUF/snapshots/7c41481f57cb95916b40956ab2f0b139b296d974/Qwen3-8B-Q4_K_M.gguf   -f /root/autodl-tmp/llama.cpp/examples/zeroth-order-opt/gsm8k_test.jsonl   -o /root/autodl-tmp/llama.cpp/Qwen3_Q4_K_M_finetuned.gguf  --epochs 1
+
+./bin/llama-perplexity -m /root/autodl-tmp/llama.cpp/Qwen3_Q4_K_M_finetuned.gguf -f /root/autodl-tmp/llama.cpp/examples/zeroth-order-opt/wiki.test.raw
+
+./bin/llama-perplexity -m /root/.cache/huggingface/hub/models--Qwen--Qwen3-8B-GGUF/snapshots/7c41481f57cb95916b40956ab2f0b139b296d974/Qwen3-8B-Q4_K_M.gguf -f /root/autodl-tmp/llama.cpp/examples/zeroth-order-opt/wiki.test.raw
+
+./llama-simple-chat -m /root/autodl-tmp/llama.cpp/Qwen3_Q4_K_M_finetuned.gguf -c 2048
+
+./bin/llama-server -m /root/.cache/huggingface/hub/models--Qwen--Qwen3-8B-GGUF/snapshots/7c41481f57cb95916b40956ab2f0b139b296d974/Qwen3-8B-Q4_K_M.gguf -c 4096 --port 8080
+
+./bin/llama-server -m /root/autodl-tmp/llama.cpp/Qwen3_Q4_K_M_finetuned.gguf -c 4096 --port 8080

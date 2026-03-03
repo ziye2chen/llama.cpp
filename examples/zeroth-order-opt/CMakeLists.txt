@@ -37,6 +37,8 @@ add_executable(${TARGET4}
     finetune-radazo-quant.cpp
     radazo-optimizer.cpp
     radazo-optimizer.h
+    lora-adapter.cpp
+    lora-adapter.h
 )
 target_link_libraries(${TARGET4} PRIVATE ggml llama common)
 target_compile_features(${TARGET4} PRIVATE cxx_std_11)

@@ -14,6 +14,7 @@
 #include <fstream>
 #include <sstream>
 #include <iomanip>
+#include <cstring>
 
 static constexpr const char * k_memory_log_path = "memory.txt";
 
@@ -201,6 +202,22 @@ float RAdaZOOptimizer::compute_loss(float * logits, int n_vocab, llama_token tar
     return std::sqrt(loss);
 }
 
+float RAdaZOOptimizer::compute_loss_with_postprocess(
+    struct llama_context * ctx,
+    float * logits,
+    int n_vocab,
+    llama_token target_token) {
+
+    if (!logits_postprocessor_) {
+        return compute_loss(logits, n_vocab, target_token);
+    }
+
+    scratch_logits_.resize(n_vocab);
+    std::memcpy(scratch_logits_.data(), logits, n_vocab * sizeof(float));
+    logits_postprocessor_(ctx, scratch_logits_.data(), n_vocab);
+    return compute_loss(scratch_logits_.data(), n_vocab, target_token);
+}
+
 // Generate normalized random perturbation (unit norm)
 void RAdaZOOptimizer::fill_perturbation(
     std::vector<float> & out,
@@ -343,7 +360,7 @@ void RAdaZOOptimizer::estimate_tensor_gradient_radazo(
 
         // Compute loss with perturbed parameter: f(x + mu*u)
         float * logits_perturbed = llama_get_logits_ith(ctx, batch.n_tokens - 1);
-        float loss_plus = compute_loss(logits_perturbed, n_vocab, target_token);
+        float loss_plus = compute_loss_with_postprocess(ctx, logits_perturbed, n_vocab, target_token);
 
         // Gradient estimate contribution: (f(x + mu*u) - f(x)) * u / mu
         const float scale = (loss_plus - loss_base) / params_.mu;
@@ -475,7 +492,7 @@ float RAdaZOOptimizer::step(
     
     // Compute baseline loss
     float * logits_base = llama_get_logits_ith(ctx, batch.n_tokens - 1);
-    float loss_base = compute_loss(logits_base, n_vocab, target_token);
+    float loss_base = compute_loss_with_postprocess(ctx, logits_base, n_vocab, target_token);
     forward_passes++;
     
     // Random parameter sampling without replacement to avoid duplicated work

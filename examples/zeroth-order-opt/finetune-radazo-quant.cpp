@@ -10,6 +10,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "radazo-optimizer.h"
+#include "lora-adapter.h"
 #include "json.hpp"
 
 #include <cmath>
@@ -552,11 +553,18 @@ int main(int argc, char ** argv) {
 
     LOG_INF("%s: train_tokens=%zu, eval_tokens=%zu\n\n", __func__, train_set.size(), eval_set.size());
 
-    // *** SETUP R-AdaZO OPTIMIZER ***
-    // Collect trainable parameters directly from the model
-    // The optimizer handles quantized types transparently (dequant -> perturb -> requant)
-    auto trainable_params = collect_trainable_parameters_radazo(ctx.get(), true);
-    LOG_INF("%s: found %zu trainable parameter tensors\n\n", __func__, trainable_params.size());
+    // *** SETUP LoRA + R-AdaZO OPTIMIZER ***
+    lora_config lora_cfg;
+    LoRAAdapter lora_adapter(ctx.get(), lora_cfg);
+    if (!lora_adapter.initialize()) {
+        LOG_ERR("%s: failed to initialize LoRA adapters\n", __func__);
+        return 1;
+    }
+
+    auto trainable_params = lora_adapter.get_trainable_params();
+    LOG_INF("%s: LoRA layers: %zu, trainable LoRA tensors (A/B): %zu\n",
+            __func__, lora_adapter.get_num_layers(), trainable_params.size());
+    LOG_INF("%s: total LoRA parameters: %ld\n\n", __func__, lora_adapter.get_total_params());
 
     if (trainable_params.empty()) {
         LOG_ERR("%s: no trainable parameters found!\n", __func__);
@@ -592,24 +600,28 @@ int main(int argc, char ** argv) {
             radazo_config.n_samples,
             1 + radazo_config.n_params_per_iter * radazo_config.n_samples);
 
-    // Create the R-AdaZO optimizer with the model's actual tensors
+    // Create the R-AdaZO optimizer with LoRA A/B tensors only.
     RAdaZOOptimizer optimizer(radazo_config, trainable_params);
+    optimizer.set_logits_postprocessor([&lora_adapter](struct llama_context * ctx, float * logits, int n_vocab) {
+        lora_adapter.apply_lora_to_logits(ctx, logits, n_vocab);
+    });
 
     // Run fine-tuning
     int n_epochs = 1;
     finetune_radazo_quant(ctx.get(), train_set, eval_set, optimizer, n_epochs);
 
-    // Save the fine-tuned model directly
-    // The quantized tensors have been modified in-place (dequant -> update -> requant)
-    // so saving the model preserves the updates in the original quantized format
+    // Save by merging LoRA adapters into base model.
     std::string output_file = params.out_file.empty() ?
         "model_radazo_finetuned.gguf" : params.out_file;
 
     LOG_INF("\n%s: saving fine-tuned model to %s\n", __func__, output_file.c_str());
 
-    // Ensure all backend tensor updates are visible before save (critical for GPU)
+    // Ensure all backend updates are visible before merge.
     llama_synchronize(ctx.get());
-    llama_model_save_to_file(model.get(), output_file.c_str());
+    if (!lora_adapter.merge_and_save(model.get(), output_file)) {
+        LOG_ERR("%s: failed to merge LoRA adapters and save model\n", __func__);
+        return 1;
+    }
 
     LOG_INF("%s: model saved successfully!\n", __func__);
     LOG_INF("\n%s: ===== SUMMARY =====\n", __func__);

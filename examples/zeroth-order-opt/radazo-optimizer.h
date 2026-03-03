@@ -14,6 +14,7 @@
 #include <random>
 #include <unordered_map>
 #include <string>
+#include <functional>
 
 // R-AdaZO optimization parameters
 struct radazo_params {
@@ -40,6 +41,8 @@ struct radazo_param_state {
 // Works with both FP32 and quantized model tensors
 class RAdaZOOptimizer {
 public:
+    using logits_postprocessor_t = std::function<void(struct llama_context *, float *, int)>;
+
     // Constructor
     RAdaZOOptimizer(
         const radazo_params & params,
@@ -56,6 +59,9 @@ public:
     // Get statistics
     int64_t get_total_updates() const { return total_updates; }
     int64_t get_forward_passes() const { return forward_passes; }
+
+    // Optional hook to modify logits before loss evaluation (e.g. LoRA adapters).
+    void set_logits_postprocessor(logits_postprocessor_t hook) { logits_postprocessor_ = std::move(hook); }
     
 private:
     // Compute loss from logits
@@ -86,6 +92,13 @@ private:
     // Get or create state for a parameter
     radazo_param_state & get_state(struct ggml_tensor * param);
 
+    // Compute loss after optional logits post-processing.
+    float compute_loss_with_postprocess(
+        struct llama_context * ctx,
+        float * logits,
+        int n_vocab,
+        llama_token target_token);
+
     // Drop large intermediate buffers once a parameter step finishes.
     void clear_intermediate_buffers();
 
@@ -112,6 +125,7 @@ private:
     std::vector<uint8_t> scratch_quant_snapshot_;
     std::vector<uint8_t> scratch_quant_perturbed_;
     std::vector<uint8_t> scratch_quant_updated_;
+    std::vector<float> scratch_logits_;
     
     // Random number generator
     std::mt19937 rng_;
@@ -120,6 +134,7 @@ private:
     int64_t total_updates;
     int64_t forward_passes;
     int64_t global_step;
+    logits_postprocessor_t logits_postprocessor_;
 };
 
 // Helper function: Collect trainable parameters from model

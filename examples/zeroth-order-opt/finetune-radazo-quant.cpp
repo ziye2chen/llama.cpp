@@ -21,6 +21,10 @@
 #include <fstream>
 #include <sstream>
 #include <iomanip>
+#include <algorithm>
+#include <utility>
+#include <limits>
+#include <cstdlib>
 
 // Platform-specific headers for CPU and memory monitoring
 #if defined(_WIN32)
@@ -43,6 +47,7 @@
 
 using json = nlohmann::json;
 static constexpr const char * k_memory_log_path = "memory.txt";
+static constexpr bool k_enable_memory_logging = false;
 
 // ========================================
 // System Resource Monitoring
@@ -119,6 +124,9 @@ static void append_memory_log_train(
         int64_t iter,
         int32_t batch_tokens,
         const char * extra = nullptr) {
+    if (!k_enable_memory_logging) {
+        return;
+    }
     const float cpu_mb = get_memory_usage_mb();
     float gpu_used_mb = 0.0f, gpu_free_mb = 0.0f, gpu_total_mb = 0.0f;
     const bool has_gpu = get_gpu_memory_usage_mb(gpu_used_mb, gpu_free_mb, gpu_total_mb);
@@ -211,18 +219,41 @@ struct cpu_usage_tracker {
 
 struct training_config {
     int32_t max_train_samples = 10;
+    int32_t max_eval_samples = 10;
     int32_t max_tokens_per_sample = 512;
 };
 
-// GSM8K data structure
-struct gsm8k_example {
+// DROP data structure
+struct drop_example {
+    std::string section_id;
+    std::string query_id;
+    std::string passage;
     std::string question;
-    std::string answer;
+    std::string answer_span;
 };
 
-// Load GSM8K dataset from JSONL file
-static std::vector<gsm8k_example> load_gsm8k(const std::string & filepath, int max_samples = -1) {
-    std::vector<gsm8k_example> examples;
+static std::string json_value_to_string(const json & v) {
+    if (v.is_string()) {
+        return v.get<std::string>();
+    }
+    if (v.is_number_integer()) {
+        return std::to_string(v.get<long long>());
+    }
+    if (v.is_number_unsigned()) {
+        return std::to_string(v.get<unsigned long long>());
+    }
+    if (v.is_number_float()) {
+        std::ostringstream oss;
+        oss << v.get<double>();
+        return oss.str();
+    }
+    return v.dump();
+}
+
+// Load DROP dataset from a JSON array file without parsing the full file into memory.
+// This keeps startup memory lower for very large train splits.
+static std::vector<drop_example> load_drop_json_array_stream(const std::string & filepath, int max_samples = -1) {
+    std::vector<drop_example> examples;
     std::ifstream file(filepath);
 
     if (!file.is_open()) {
@@ -230,66 +261,206 @@ static std::vector<gsm8k_example> load_gsm8k(const std::string & filepath, int m
         return examples;
     }
 
-    std::string line;
+    std::string obj_buf;
+    obj_buf.reserve(4096);
+    bool in_string = false;
+    bool escape = false;
+    bool capturing = false;
+    int depth = 0;
     int count = 0;
-
-    while (std::getline(file, line) && (max_samples <= 0 || count < max_samples)) {
-        try {
-            json j = json::parse(line);
-            gsm8k_example ex;
-            ex.question = j["question"].get<std::string>();
-            ex.answer = j["answer"].get<std::string>();
-            examples.push_back(ex);
-            count++;
-        } catch (const std::exception & e) {
-            LOG_ERR("%s: error parsing JSON line %d: %s\n", __func__, count + 1, e.what());
+    char ch = 0;
+    while (file.get(ch) && (max_samples <= 0 || count < max_samples)) {
+        if (!capturing) {
+            if (ch == '{') {
+                capturing = true;
+                depth = 1;
+                in_string = false;
+                escape = false;
+                obj_buf.clear();
+                obj_buf.push_back(ch);
+            }
             continue;
+        }
+
+        obj_buf.push_back(ch);
+
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (ch == '\\') {
+            escape = true;
+            continue;
+        }
+        if (ch == '"') {
+            in_string = !in_string;
+            continue;
+        }
+        if (in_string) {
+            continue;
+        }
+        if (ch == '{') {
+            depth++;
+            continue;
+        }
+        if (ch == '}') {
+            depth--;
+            if (depth > 0) {
+                continue;
+            }
+
+            capturing = false;
+            depth = 0;
+            json j = json::parse(obj_buf, nullptr, false);
+            if (j.is_discarded()) {
+                continue;
+            }
+
+            if (!j.contains("passage") || !j.contains("question") || !j.contains("answers_spans")) {
+                continue;
+            }
+            if (!j["answers_spans"].is_object()) {
+                continue;
+            }
+
+            const json & ans = j["answers_spans"];
+            if (!ans.contains("spans")) {
+                continue;
+            }
+
+            drop_example ex;
+            ex.section_id = j.value("section_id", "");
+            ex.query_id = j.value("query_id", "");
+            ex.passage = j.value("passage", "");
+            ex.question = j.value("question", "");
+
+            const json & spans = ans["spans"];
+            if (spans.is_array()) {
+                if (spans.empty()) {
+                    continue;
+                }
+                ex.answer_span = json_value_to_string(spans[0]);
+            } else {
+                ex.answer_span = json_value_to_string(spans);
+            }
+
+            if (ex.passage.empty() || ex.question.empty() || ex.answer_span.empty()) {
+                continue;
+            }
+
+            examples.push_back(std::move(ex));
+            count++;
         }
     }
 
-    file.close();
-    LOG_INF("%s: loaded %zu GSM8K examples\n", __func__, examples.size());
+    LOG_INF("%s: loaded %zu DROP examples from %s\n", __func__, examples.size(), filepath.c_str());
     return examples;
 }
 
-// Format GSM8K example for training
-static std::string format_gsm8k_prompt(const gsm8k_example & ex) {
+// Format DROP example for training
+static std::string format_drop_prompt(const drop_example & ex) {
     std::stringstream ss;
+    ss << "Passage: " << ex.passage << "\n";
     ss << "Question: " << ex.question << "\n";
-    ss << "Answer: " << ex.answer;
+    ss << "Answer: " << ex.answer_span;
     return ss.str();
 }
 
-// Convert GSM8K examples to token sequences
-static std::vector<llama_token> gsm8k_to_tokens(
+// Convert DROP examples to per-sample token sequences.
+// Each training sample remains independent (no sequence packing).
+static std::vector<std::vector<llama_token>> drop_to_token_sequences(
         struct llama_context * ctx,
-        const std::vector<gsm8k_example> & examples,
+        const std::vector<drop_example> & examples,
         int max_tokens_per_sample = -1) {
 
-    std::vector<llama_token> all_tokens;
+    std::vector<std::vector<llama_token>> tokenized_samples;
+    tokenized_samples.reserve(examples.size());
+    size_t total_tokens = 0;
 
-    LOG_INF("%s: tokenizing %zu GSM8K examples...\n", __func__, examples.size());
+    LOG_INF("%s: tokenizing %zu DROP examples...\n", __func__, examples.size());
 
     for (size_t i = 0; i < examples.size(); ++i) {
-        std::string prompt = format_gsm8k_prompt(examples[i]);
-        std::vector<llama_token> tokens = common_tokenize(ctx, prompt, true);
+        try {
+            std::string prompt = format_drop_prompt(examples[i]);
+            std::vector<llama_token> tokens = common_tokenize(ctx, prompt, true);
 
-        if (max_tokens_per_sample > 0 && tokens.size() > (size_t)max_tokens_per_sample) {
-            tokens.resize(max_tokens_per_sample);
-        }
+            if (max_tokens_per_sample > 0 && tokens.size() > (size_t)max_tokens_per_sample) {
+                tokens.resize(max_tokens_per_sample);
+            }
 
-        all_tokens.insert(all_tokens.end(), tokens.begin(), tokens.end());
+            total_tokens += tokens.size();
+            tokenized_samples.push_back(std::move(tokens));
 
-        if ((i + 1) % 10 == 0) {
-            LOG_INF("%s: tokenized %zu/%zu examples (%zu tokens total)\n",
-                    __func__, i + 1, examples.size(), all_tokens.size());
+            if ((i + 1) % 10 == 0) {
+                LOG_INF("%s: tokenized %zu/%zu examples (%zu tokens total)\n",
+                        __func__, i + 1, examples.size(), total_tokens);
+            }
+        } catch (const std::exception & e) {
+            LOG_ERR("%s: error tokenizing DROP example %zu: %s\n", __func__, i, e.what());
         }
     }
 
-    LOG_INF("%s: total tokens from %zu examples: %zu\n",
-            __func__, examples.size(), all_tokens.size());
+    LOG_INF("%s: tokenized DROP samples=%zu, total tokens=%zu\n",
+            __func__, tokenized_samples.size(), total_tokens);
 
-    return all_tokens;
+    return tokenized_samples;
+}
+
+static size_t count_total_tokens(const std::vector<std::vector<llama_token>> & samples) {
+    size_t total = 0;
+    for (const auto & sample : samples) {
+        total += sample.size();
+    }
+    return total;
+}
+
+static bool parse_int32_arg(const char * s, int32_t & out) {
+    if (s == nullptr || s[0] == '\0') {
+        return false;
+    }
+    char * end = nullptr;
+    long v = std::strtol(s, &end, 10);
+    if (end == nullptr || *end != '\0') {
+        return false;
+    }
+    if (v < std::numeric_limits<int32_t>::min() || v > std::numeric_limits<int32_t>::max()) {
+        return false;
+    }
+    out = (int32_t) v;
+    return true;
+}
+
+static int32_t parse_epochs_from_argv(int argc, char ** argv, int32_t fallback) {
+    int32_t epochs = fallback;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--epochs" && i + 1 < argc) {
+            int32_t parsed = 0;
+            if (parse_int32_arg(argv[i + 1], parsed) && parsed > 0) {
+                epochs = parsed;
+            }
+            i++;
+        } else if (a.rfind("--epochs=", 0) == 0) {
+            int32_t parsed = 0;
+            const std::string v = a.substr(std::string("--epochs=").size());
+            if (parse_int32_arg(v.c_str(), parsed) && parsed > 0) {
+                epochs = parsed;
+            }
+        }
+    }
+    return epochs;
+}
+
+static std::vector<std::vector<llama_token>> filter_short_samples(
+        const std::vector<std::vector<llama_token>> & samples) {
+    std::vector<std::vector<llama_token>> out;
+    out.reserve(samples.size());
+    for (const auto & s : samples) {
+        if (s.size() >= 2) {
+            out.push_back(s);
+        }
+    }
+    return out;
 }
 
 // Progress callback with CPU and memory monitoring
@@ -315,90 +486,99 @@ static void progress_callback(
     fflush(stderr);
 }
 
+static bool build_sample_batch(
+        const std::vector<llama_token> & sample_tokens,
+        int n_ctx,
+        llama_batch & batch,
+        std::vector<radazo_loss_target> & loss_targets) {
+    const int seq_len = std::min((int) sample_tokens.size(), n_ctx);
+    if (seq_len < 2) {
+        return false;
+    }
+
+    batch = llama_batch_init(seq_len, 0, 1);
+    loss_targets.clear();
+
+    // Use the second-to-last position to predict the last token (the answer).
+    // Format: "Passage: ...\nQuestion: ...\nAnswer: 3" → last token = answer.
+    const int loss_pos = seq_len - 2;
+
+    for (int pos = 0; pos < seq_len; ++pos) {
+        batch.token[pos] = sample_tokens[pos];
+        batch.pos[pos] = pos;
+        batch.n_seq_id[pos] = 1;
+        batch.seq_id[pos][0] = 0;
+        batch.logits[pos] = (pos == loss_pos);
+    }
+    batch.n_tokens = seq_len;
+
+    loss_targets.push_back({loss_pos, sample_tokens[loss_pos + 1], 1.0f});
+    return true;
+}
+
 // ========================================
 // R-AdaZO fine-tuning loop
 // ========================================
 
 static void finetune_radazo_quant(
         struct llama_context * ctx,
-        const std::vector<llama_token> & train_tokens,
-        const std::vector<llama_token> & /* eval_tokens */,
+        const std::vector<std::vector<llama_token>> & train_samples,
+        const std::vector<std::vector<llama_token>> & /* eval_samples */,
         RAdaZOOptimizer & optimizer,
+        LoRAAdapter & lora_adapter,
         int n_epochs) {
+    (void) lora_adapter;
 
-    LOG_INF("\n%s: starting R-AdaZO fine-tuning (quantized model, direct tensor modification)...\n", __func__);
+    LOG_INF("\n%s: starting R-AdaZO fine-tuning (QLoRA A/B only)...\n", __func__);
 
     const int n_ctx = llama_n_ctx(ctx);
-    const int n_batch = llama_n_batch(ctx);
     const struct llama_model * model_ptr = llama_get_model(ctx);
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_ptr));
 
-    LOG_INF("%s: n_ctx=%d, n_batch=%d, n_train_tokens=%zu, n_epochs=%d\n",
-            __func__, n_ctx, n_batch, train_tokens.size(), n_epochs);
+    LOG_INF("%s: n_ctx=%d, n_train_samples=%zu, n_epochs=%d\n",
+            __func__, n_ctx, train_samples.size(), n_epochs);
 
     cpu_usage_tracker cpu_tracker;
+    const int64_t iters_per_epoch = (int64_t) train_samples.size();
 
-    // Training loop
+    // Native llama_adapter_lora is already registered in lora_adapter.initialize().
+    // llama_decode() automatically applies LoRA via the compute graph.
+    // Base tensors are never modified during training.
+
     for (int epoch = 0; epoch < n_epochs; ++epoch) {
         LOG_INF("\n%s: ===== Epoch %d/%d =====\n", __func__, epoch + 1, n_epochs);
         append_memory_log_train("epoch_begin", epoch + 1, 0, 0);
 
         const int64_t t_epoch_start = ggml_time_us();
-        int64_t n_batches = 0;
+        int64_t n_done = 0;
         float epoch_loss = 0.0f;
 
-        // Process training data in batches
-        for (size_t i = 0; i + n_batch < train_tokens.size(); i += n_batch) {
-            const llama_token target_token = train_tokens[i + n_batch];
-            append_memory_log_train("batch_begin", epoch + 1, n_batches + 1, n_batch);
+        for (size_t si = 0; si < train_samples.size(); ++si) {
+            llama_batch batch = {};
+            std::vector<radazo_loss_target> loss_targets;
 
-            // Clear KV cache at start of each batch
-            llama_memory_clear(llama_get_memory(ctx), true);
-            append_memory_log_train("after_kv_clear", epoch + 1, n_batches + 1, n_batch);
-
-            // Prepare batch
-            llama_batch batch = llama_batch_init(n_batch, 0, 1);
-            for (int j = 0; j < n_batch && i + j < train_tokens.size(); ++j) {
-                batch.token[j] = train_tokens[i + j];
-                batch.pos[j] = j;
-                batch.n_seq_id[j] = 1;
-                batch.seq_id[j][0] = 0;
-                batch.logits[j] = (j == n_batch - 1);
-            }
-            batch.n_tokens = n_batch;
-
-            // Forward pass to get baseline loss
-            if (llama_decode(ctx, batch) != 0) {
-                LOG_ERR("%s: failed to decode batch\n", __func__);
-                llama_batch_free(batch);
+            if (!build_sample_batch(train_samples[si], n_ctx, batch, loss_targets)) {
+                LOG_ERR("%s: sample %zu too short, skipping\n", __func__, si);
                 continue;
             }
-            append_memory_log_train("after_baseline_decode", epoch + 1, n_batches + 1, n_batch);
 
-            // *** R-AdaZO optimizer step ***
-            // The optimizer handles quantized tensors transparently:
-            // dequantize -> perturb in FP32 -> requantize -> forward -> restore -> Adam update
-            float batch_loss = optimizer.step(ctx, batch, n_vocab, target_token);
-            append_memory_log_train("after_optimizer_step", epoch + 1, n_batches + 1, n_batch);
+            float sample_loss = optimizer.step(ctx, batch, n_vocab, loss_targets);
 
-            epoch_loss += batch_loss;
-            n_batches++;
+            epoch_loss += sample_loss;
+            n_done++;
 
-            // Progress reporting (print every iteration)
-            progress_callback(true, n_batches,
-                train_tokens.size() / n_batch, epoch_loss / n_batches, t_epoch_start, cpu_tracker);
+            progress_callback(true, n_done, iters_per_epoch,
+                epoch_loss / n_done, t_epoch_start, cpu_tracker);
 
             llama_batch_free(batch);
-            append_memory_log_train("after_batch_free", epoch + 1, n_batches, n_batch);
         }
 
         fprintf(stderr, "\n");
-        LOG_INF("%s: Epoch %d complete - Avg Loss: %.6f\n",
-                __func__, epoch + 1, epoch_loss / n_batches);
-        append_memory_log_train("epoch_end", epoch + 1, n_batches, n_batch);
+        LOG_INF("%s: Epoch %d complete - Avg Loss: %.6f, samples=%ld\n",
+                __func__, epoch + 1, n_done > 0 ? epoch_loss / n_done : 0.0f, n_done);
+        append_memory_log_train("epoch_end", epoch + 1, n_done, 0);
     }
 
-    // Print optimizer statistics
     LOG_INF("\n%s: R-AdaZO Optimizer Statistics:\n", __func__);
     LOG_INF("%s:   Total parameter updates: %ld\n", __func__, optimizer.get_total_updates());
     LOG_INF("%s:   Total forward passes: %ld\n", __func__, optimizer.get_forward_passes());
@@ -406,7 +586,6 @@ static void finetune_radazo_quant(
             optimizer.get_total_updates() > 0 ?
             (float)optimizer.get_forward_passes() / optimizer.get_total_updates() : 0.0f);
 
-    // Print final resource usage
     LOG_INF("\n%s: Final Resource Usage:\n", __func__);
     LOG_INF("%s:   Memory: %.1f MB\n", __func__, get_memory_usage_mb());
     LOG_INF("%s:   CPU: %.1f%%\n", __func__, cpu_tracker.get_cpu_usage());
@@ -423,36 +602,60 @@ int main(int argc, char ** argv) {
     params.escape = false;
 
     // Set defaults suitable for R-AdaZO
-    params.n_batch = 8;
+    // n_batch is token-capacity for runtime buffers, NOT sample batch size.
+    params.n_batch = 512;
+    params.n_ubatch = 512;
     params.n_ctx = 512;
 
-    // Default GSM8K dataset path (try multiple locations)
-    std::string gsm8k_file;
-    std::vector<std::string> possible_paths = {
-        "examples/zeroth-order-opt/gsm8k_test.jsonl",
-        "../examples/zeroth-order-opt/gsm8k_test.jsonl",
-        "../../examples/zeroth-order-opt/gsm8k_test.jsonl",
-        "../../../examples/zeroth-order-opt/gsm8k_test.jsonl"
-    };
+    training_config train_config;
 
-    for (const auto & path : possible_paths) {
+    // Default DROP dataset paths (try multiple locations)
+    std::string drop_train_file;
+    std::vector<std::string> possible_train_paths = {
+        "examples/zeroth-order-opt/drop_train.json",
+        "../examples/zeroth-order-opt/drop_train.json",
+        "../../examples/zeroth-order-opt/drop_train.json",
+        "../../../examples/zeroth-order-opt/drop_train.json"
+    };
+    for (const auto & path : possible_train_paths) {
         std::ifstream test_file(path);
         if (test_file.good()) {
-            gsm8k_file = path;
+            drop_train_file = path;
             break;
         }
     }
+    if (drop_train_file.empty()) {
+        drop_train_file = possible_train_paths[0];
+    }
 
-    if (gsm8k_file.empty()) {
-        gsm8k_file = possible_paths[0];
+    std::string drop_validation_file;
+    std::vector<std::string> possible_validation_paths = {
+        "examples/zeroth-order-opt/drop_validation.json",
+        "../examples/zeroth-order-opt/drop_validation.json",
+        "../../examples/zeroth-order-opt/drop_validation.json",
+        "../../../examples/zeroth-order-opt/drop_validation.json"
+    };
+    for (const auto & path : possible_validation_paths) {
+        std::ifstream test_file(path);
+        if (test_file.good()) {
+            drop_validation_file = path;
+            break;
+        }
+    }
+    if (drop_validation_file.empty()) {
+        drop_validation_file = possible_validation_paths[0];
     }
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_FINETUNE)) {
         return 1;
     }
 
+    // Each sample is processed independently as a single-sequence batch,
+    // so n_parallel=1 (the default) is correct and avoids the slow multi-seq
+    // decode path in llama.cpp.
+
     // Reset memory profiling log file as early as possible so startup baselines are kept.
-    {
+    if (k_enable_memory_logging) {
         std::ofstream fout(k_memory_log_path, std::ios::trunc);
         if (fout.is_open()) {
             fout << "# memory profile log\n";
@@ -512,46 +715,52 @@ int main(int argc, char ** argv) {
     }
 
     // Training configuration
-    training_config train_config;
     train_config.max_train_samples = 10;
+    train_config.max_eval_samples = 10;
     train_config.max_tokens_per_sample = 512;
 
-    // Load GSM8K dataset
-    LOG_INF("%s: Loading GSM8K dataset from: %s\n", __func__, gsm8k_file.c_str());
-    auto gsm8k_examples = load_gsm8k(gsm8k_file, train_config.max_train_samples);
+    // Load DROP train/validation datasets
+    LOG_INF("%s: Loading DROP train dataset from: %s\n", __func__, drop_train_file.c_str());
+    auto drop_train_examples = load_drop_json_array_stream(drop_train_file, train_config.max_train_samples);
 
-    if (gsm8k_examples.empty()) {
-        LOG_ERR("%s: failed to load GSM8K examples\n", __func__);
+    if (drop_train_examples.empty()) {
+        LOG_ERR("%s: failed to load DROP train examples\n", __func__);
         return 1;
     }
 
-    LOG_INF("%s: Loaded %zu GSM8K examples\n", __func__, gsm8k_examples.size());
+    LOG_INF("%s: Loading DROP validation dataset from: %s\n", __func__, drop_validation_file.c_str());
+    auto drop_validation_examples = load_drop_json_array_stream(drop_validation_file, train_config.max_eval_samples);
+    LOG_INF("%s: Loaded DROP examples - train=%zu, validation=%zu\n",
+            __func__, drop_train_examples.size(), drop_validation_examples.size());
 
     // Show first example
-    if (!gsm8k_examples.empty()) {
+    if (!drop_train_examples.empty()) {
         LOG_INF("%s: First training example:\n", __func__);
         LOG_INF("%s: ----------------------------------------\n", __func__);
-        LOG_INF("%s: %s\n", __func__, format_gsm8k_prompt(gsm8k_examples[0]).c_str());
+        LOG_INF("%s: %s\n", __func__, format_drop_prompt(drop_train_examples[0]).c_str());
         LOG_INF("%s: ----------------------------------------\n\n", __func__);
     }
 
-    // Tokenize GSM8K examples
-    std::vector<llama_token> train_tokens = gsm8k_to_tokens(
-        ctx.get(), gsm8k_examples, train_config.max_tokens_per_sample);
-
-    if (train_tokens.size() < 10) {
-        LOG_ERR("%s: training data too short (need at least 10 tokens)\n", __func__);
+    // Tokenize DROP train examples as independent sequences (no packing).
+    std::vector<std::vector<llama_token>> train_set = drop_to_token_sequences(
+        ctx.get(), drop_train_examples, train_config.max_tokens_per_sample);
+    train_set = filter_short_samples(train_set);
+    if (train_set.empty()) {
+        LOG_ERR("%s: tokenized DROP train dataset is empty\n", __func__);
         return 1;
     }
 
-    LOG_INF("%s: Total training tokens: %zu\n", __func__, train_tokens.size());
+    // Tokenize DROP validation examples for eval bookkeeping.
+    std::vector<std::vector<llama_token>> eval_set = drop_to_token_sequences(
+        ctx.get(), drop_validation_examples, train_config.max_tokens_per_sample);
+    eval_set = filter_short_samples(eval_set);
 
-    // Split into train/eval (90/10)
-    size_t split_idx = train_tokens.size() * 0.9;
-    std::vector<llama_token> train_set(train_tokens.begin(), train_tokens.begin() + split_idx);
-    std::vector<llama_token> eval_set(train_tokens.begin() + split_idx, train_tokens.end());
-
-    LOG_INF("%s: train_tokens=%zu, eval_tokens=%zu\n\n", __func__, train_set.size(), eval_set.size());
+    LOG_INF("%s: train_samples=%zu (%zu tokens), eval_samples=%zu (%zu tokens)\n\n",
+            __func__,
+            train_set.size(),
+            count_total_tokens(train_set),
+            eval_set.size(),
+            count_total_tokens(eval_set));
 
     // *** SETUP LoRA + R-AdaZO OPTIMIZER ***
     lora_config lora_cfg;
@@ -571,44 +780,35 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // Configure R-AdaZO parameters
+    // Configure R-AdaZO / Global-SPSA parameters.
+    // Each sample now costs exactly 2 * n_samples forward passes (constant).
     radazo_params radazo_config;
-    radazo_config.lr = 1e-4f;
-    radazo_config.beta1 = 0.9f;
-    radazo_config.beta2 = 0.999f;
-    radazo_config.eps = 1e-8f;
-    radazo_config.mu = 5e-3f;
-    // Faster default profile: still performs R-AdaZO, but with fewer perturbation passes.
-    // This is critical for large quantized tensors where dequant/requant dominates runtime.
-    radazo_config.n_samples = 1;
-    radazo_config.n_params_per_iter = 2;
-    radazo_config.full_tensor_gradient = true;
-    radazo_config.log_gradients = false;
+    radazo_config.lr       = 1e-5f;
+    radazo_config.beta1    = 0.9f;
+    radazo_config.beta2    = 0.999f;
+    radazo_config.eps      = 1e-8f;
+    radazo_config.mu       = 1e-4f;
+    radazo_config.n_samples = 1;   // global SPSA draws per sample (each = 2 forward passes)
+    radazo_config.log_gradients = true;
 
     LOG_INF("%s: R-AdaZO Configuration:\n", __func__);
-    LOG_INF("%s:   lr = %.2e (learning rate)\n", __func__, radazo_config.lr);
-    LOG_INF("%s:   beta1 = %.3f (first moment decay)\n", __func__, radazo_config.beta1);
-    LOG_INF("%s:   beta2 = %.3f (second moment decay)\n", __func__, radazo_config.beta2);
-    LOG_INF("%s:   mu = %.2e (perturbation magnitude)\n", __func__, radazo_config.mu);
-    LOG_INF("%s:   n_samples = %d (multiple perturbations per gradient)\n", __func__, radazo_config.n_samples);
-    LOG_INF("%s:   n_params_per_iter = %d\n", __func__, radazo_config.n_params_per_iter);
-    LOG_INF("%s:   full_tensor_gradient = %s\n", __func__,
-            radazo_config.full_tensor_gradient ? "true" : "false");
-    LOG_INF("%s:   Approx forward passes per batch = 1 + %d * %d = %d\n\n",
-            __func__,
-            radazo_config.n_params_per_iter,
-            radazo_config.n_samples,
-            1 + radazo_config.n_params_per_iter * radazo_config.n_samples);
+    LOG_INF("%s:   lr = %.2e\n",     __func__, radazo_config.lr);
+    LOG_INF("%s:   beta1 = %.3f\n",  __func__, radazo_config.beta1);
+    LOG_INF("%s:   beta2 = %.3f\n",  __func__, radazo_config.beta2);
+    LOG_INF("%s:   mu = %.2e\n",     __func__, radazo_config.mu);
+    LOG_INF("%s:   n_samples = %d  (global SPSA draws; 2 forward passes each)\n",
+            __func__, radazo_config.n_samples);
+    LOG_INF("%s:   forward passes per sample = %d\n\n",
+            __func__, 2 * radazo_config.n_samples);
 
-    // Create the R-AdaZO optimizer with LoRA A/B tensors only.
+    // Create the R-AdaZO optimizer.
+    // No param_change_hook or pair_param_hook needed: native llama_adapter_lora
+    // handles LoRA automatically inside llama_decode().
     RAdaZOOptimizer optimizer(radazo_config, trainable_params);
-    optimizer.set_logits_postprocessor([&lora_adapter](struct llama_context * ctx, float * logits, int n_vocab) {
-        lora_adapter.apply_lora_to_logits(ctx, logits, n_vocab);
-    });
 
     // Run fine-tuning
-    int n_epochs = 1;
-    finetune_radazo_quant(ctx.get(), train_set, eval_set, optimizer, n_epochs);
+    int n_epochs = parse_epochs_from_argv(argc, argv, 1);
+    finetune_radazo_quant(ctx.get(), train_set, eval_set, optimizer, lora_adapter, n_epochs);
 
     // Save by merging LoRA adapters into base model.
     std::string output_file = params.out_file.empty() ?
@@ -625,19 +825,22 @@ int main(int argc, char ** argv) {
 
     LOG_INF("%s: model saved successfully!\n", __func__);
     LOG_INF("\n%s: ===== SUMMARY =====\n", __func__);
-    LOG_INF("%s: Method: R-AdaZO (direct quantized tensor modification)\n", __func__);
-    LOG_INF("%s: Dataset: GSM8K (Grade School Math)\n", __func__);
-    LOG_INF("%s: Training samples: %zu\n", __func__, gsm8k_examples.size());
+    LOG_INF("%s: Method: LoRA + R-AdaZO (quantized base model)\n", __func__);
+    LOG_INF("%s: Dataset: DROP (passage/question/answer span)\n", __func__);
+    LOG_INF("%s: Loaded train examples: %zu\n", __func__, drop_train_examples.size());
+    LOG_INF("%s: Loaded validation examples: %zu\n", __func__, drop_validation_examples.size());
     LOG_INF("%s: Epochs: %d\n", __func__, n_epochs);
-    LOG_INF("%s: Training tokens: %zu\n", __func__, train_set.size());
+    LOG_INF("%s: Training samples: %zu\n", __func__, train_set.size());
+    LOG_INF("%s: Training tokens: %zu\n", __func__, count_total_tokens(train_set));
     LOG_INF("%s: Output model: %s\n", __func__, output_file.c_str());
-    LOG_INF("\n%s: How it works for quantized models:\n", __func__);
-    LOG_INF("%s:   1. Dequantize tensor to FP32\n", __func__);
-    LOG_INF("%s:   2. Perturb in FP32 space\n", __func__);
-    LOG_INF("%s:   3. Requantize and set for forward pass\n", __func__);
-    LOG_INF("%s:   4. Estimate gradient from loss difference\n", __func__);
-    LOG_INF("%s:   5. Apply Adam update in FP32, requantize, write back\n", __func__);
-    LOG_INF("%s:   -> Model saved in original quantized format with updated weights\n", __func__);
+    LOG_INF("\n%s: How it works (Global-SPSA QLoRA on quantized models):\n", __func__);
+    LOG_INF("%s:   1. Native llama_adapter_lora registered at startup\n", __func__);
+    LOG_INF("%s:   2. Base GGUF tensors are read-only throughout training\n", __func__);
+    LOG_INF("%s:   3. llama_decode() auto-computes Y = W_base*X + (a/r)*B*A*X\n", __func__);
+    LOG_INF("%s:   4. Global SPSA: ALL LoRA A/B perturbed simultaneously\n", __func__);
+    LOG_INF("%s:      → 2 forward passes per sample (constant, not per-param)\n", __func__);
+    LOG_INF("%s:   5. Adam update applied to all LoRA A/B in one step\n", __func__);
+    LOG_INF("%s:   6. Final GGUF saved by merging trained LoRA into base once\n", __func__);
 
     llama_backend_free();
 

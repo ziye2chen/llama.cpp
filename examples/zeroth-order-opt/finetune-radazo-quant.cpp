@@ -551,7 +551,7 @@ static void finetune_radazo_quant(
 
         const int64_t t_epoch_start = ggml_time_us();
         int64_t n_done = 0;
-        float epoch_loss = 0.0f;
+        float epoch_loss_sum = 0.0f;
 
         for (size_t si = 0; si < train_samples.size(); ++si) {
             llama_batch batch = {};
@@ -562,20 +562,22 @@ static void finetune_radazo_quant(
                 continue;
             }
 
+            // Per-step independent loss returned by optimizer for this sample.
             float sample_loss = optimizer.step(ctx, batch, n_vocab, loss_targets);
 
-            epoch_loss += sample_loss;
+            epoch_loss_sum += sample_loss;
             n_done++;
 
+            // Show current step loss (not running average).
             progress_callback(true, n_done, iters_per_epoch,
-                epoch_loss / n_done, t_epoch_start, cpu_tracker);
+                sample_loss, t_epoch_start, cpu_tracker);
 
             llama_batch_free(batch);
         }
 
         fprintf(stderr, "\n");
         LOG_INF("%s: Epoch %d complete - Avg Loss: %.6f, samples=%ld\n",
-                __func__, epoch + 1, n_done > 0 ? epoch_loss / n_done : 0.0f, n_done);
+                __func__, epoch + 1, n_done > 0 ? epoch_loss_sum / n_done : 0.0f, n_done);
         append_memory_log_train("epoch_end", epoch + 1, n_done, 0);
     }
 
@@ -606,6 +608,9 @@ int main(int argc, char ** argv) {
     params.n_batch = 512;
     params.n_ubatch = 512;
     params.n_ctx = 512;
+    // Prefer GPU offload by default when CUDA backend is available.
+    // User-provided CLI flags (e.g. --n-gpu-layers) still override this.
+    params.n_gpu_layers = 999;
 
     training_config train_config;
 
@@ -644,6 +649,20 @@ int main(int argc, char ** argv) {
     }
     if (drop_validation_file.empty()) {
         drop_validation_file = possible_validation_paths[0];
+    }
+
+    bool save_lora_only = false;
+    {
+        int n = 0;
+        for (int i = 0; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--save-lora-only") == 0) {
+                save_lora_only = true;
+                continue;
+            }
+            argv[n++] = argv[i];
+        }
+        argc = n;
+        argv[argc] = nullptr;
     }
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_FINETUNE)) {
@@ -801,6 +820,9 @@ int main(int argc, char ** argv) {
     LOG_INF("%s:   forward passes per sample = %d\n\n",
             __func__, 2 * radazo_config.n_samples);
 
+    // Sync backend before optimizer reads LoRA tensors (may be on GPU).
+    llama_synchronize(ctx.get());
+
     // Create the R-AdaZO optimizer.
     // No param_change_hook or pair_param_hook needed: native llama_adapter_lora
     // handles LoRA automatically inside llama_decode().
@@ -810,20 +832,46 @@ int main(int argc, char ** argv) {
     int n_epochs = parse_epochs_from_argv(argc, argv, 1);
     finetune_radazo_quant(ctx.get(), train_set, eval_set, optimizer, lora_adapter, n_epochs);
 
-    // Save by merging LoRA adapters into base model.
+    // Save: either merge into base model, or export standalone FP32 LoRA (Phase 3 verification).
     std::string output_file = params.out_file.empty() ?
-        "model_radazo_finetuned.gguf" : params.out_file;
+        (save_lora_only ? "lora_fp32.gguf" : "model_radazo_finetuned.gguf") : params.out_file;
 
-    LOG_INF("\n%s: saving fine-tuned model to %s\n", __func__, output_file.c_str());
+    LOG_INF("\n%s: saving %s to %s\n", __func__,
+            save_lora_only ? "standalone FP32 LoRA (no merge)" : "fine-tuned model", output_file.c_str());
 
-    // Ensure all backend updates are visible before merge.
+    // Ensure all backend updates are visible before save.
     llama_synchronize(ctx.get());
-    if (!lora_adapter.merge_and_save(model.get(), output_file)) {
-        LOG_ERR("%s: failed to merge LoRA adapters and save model\n", __func__);
-        return 1;
+    if (save_lora_only) {
+        if (!lora_adapter.save_lora_standalone(model.get(), output_file)) {
+            LOG_ERR("%s: failed to save standalone LoRA adapter\n", __func__);
+            return 1;
+        }
+        LOG_INF("%s: LoRA saved. Verify with: ./llama-cli -m <baseline.gguf> --lora %s -p \"...\"\n",
+                __func__, output_file.c_str());
+    } else {
+        // Two-stage flow:
+        //  1) train with GPU-offloaded model
+        //  2) reload a CPU-weight model for stable read/write during merge
+        common_params params_merge = params;
+        params_merge.n_gpu_layers = 0;
+        params_merge.tensor_buft_overrides.clear();
+        params_merge.tensor_buft_overrides.push_back({ ".*\\.weight$", ggml_backend_cpu_buffer_type() });
+        params_merge.tensor_buft_overrides.push_back({ nullptr, nullptr });
+
+        LOG_INF("%s: reloading model on CPU buffers for merge stage\n", __func__);
+        common_init_result merge_init = common_init_from_params(params_merge);
+        if (merge_init.model == nullptr) {
+            LOG_ERR("%s: failed to load merge-stage model\n", __func__);
+            return 1;
+        }
+
+        if (!lora_adapter.merge_and_save(merge_init.model.get(), output_file)) {
+            LOG_ERR("%s: failed to merge LoRA adapters and save model\n", __func__);
+            return 1;
+        }
     }
 
-    LOG_INF("%s: model saved successfully!\n", __func__);
+    LOG_INF("%s: save completed successfully!\n", __func__);
     LOG_INF("\n%s: ===== SUMMARY =====\n", __func__);
     LOG_INF("%s: Method: LoRA + R-AdaZO (quantized base model)\n", __func__);
     LOG_INF("%s: Dataset: DROP (passage/question/answer span)\n", __func__);

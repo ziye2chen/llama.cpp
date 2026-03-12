@@ -223,13 +223,18 @@ struct training_config {
     int32_t max_tokens_per_sample = 512;
 };
 
-// DROP data structure
-struct drop_example {
-    std::string section_id;
-    std::string query_id;
-    std::string passage;
-    std::string question;
-    std::string answer_span;
+// SST-2 data structure
+struct sst2_example {
+    std::string sentence;
+    std::string label_str;  // "positive" or "negative"
+    int label_idx = 0;      // optional numeric label from JSON
+};
+
+// SFT sample: prompt tokens + label tokens (+ optional EOS)
+struct sft_sample {
+    std::vector<llama_token> tokens;
+    int prompt_length = 0;        // number of prompt tokens
+    llama_token label_token = -1; // first label token ("positive"/"negative")
 };
 
 static std::string json_value_to_string(const json & v) {
@@ -250,10 +255,10 @@ static std::string json_value_to_string(const json & v) {
     return v.dump();
 }
 
-// Load DROP dataset from a JSON array file without parsing the full file into memory.
+// Load SST-2 dataset from a JSON array file without parsing the full file into memory.
 // This keeps startup memory lower for very large train splits.
-static std::vector<drop_example> load_drop_json_array_stream(const std::string & filepath, int max_samples = -1) {
-    std::vector<drop_example> examples;
+static std::vector<sst2_example> load_sst2_json_array_stream(const std::string & filepath, int max_samples = -1) {
+    std::vector<sst2_example> examples;
     std::ifstream file(filepath);
 
     if (!file.is_open()) {
@@ -316,7 +321,7 @@ static std::vector<drop_example> load_drop_json_array_stream(const std::string &
                 continue;
             }
 
-            if (!j.contains("passage") || !j.contains("question") || !j.contains("answers_spans")) {
+            if (!j.contains("passage") || !j.contains("answers_spans")) {
                 continue;
             }
             if (!j["answers_spans"].is_object()) {
@@ -328,23 +333,28 @@ static std::vector<drop_example> load_drop_json_array_stream(const std::string &
                 continue;
             }
 
-            drop_example ex;
-            ex.section_id = j.value("section_id", "");
-            ex.query_id = j.value("query_id", "");
-            ex.passage = j.value("passage", "");
-            ex.question = j.value("question", "");
+            sst2_example ex;
+            ex.sentence = j.value("passage", "");
+            ex.label_idx = j.value("label", 0);
 
             const json & spans = ans["spans"];
             if (spans.is_array()) {
                 if (spans.empty()) {
                     continue;
                 }
-                ex.answer_span = json_value_to_string(spans[0]);
+                ex.label_str = json_value_to_string(spans[0]);
             } else {
-                ex.answer_span = json_value_to_string(spans);
+                ex.label_str = json_value_to_string(spans);
             }
 
-            if (ex.passage.empty() || ex.question.empty() || ex.answer_span.empty()) {
+            // Normalize labels to the expected two classes.
+            if (ex.label_str == "1") ex.label_str = "positive";
+            if (ex.label_str == "0") ex.label_str = "negative";
+
+            if (ex.sentence.empty() || ex.label_str.empty()) {
+                continue;
+            }
+            if (ex.label_str != "positive" && ex.label_str != "negative") {
                 continue;
             }
 
@@ -353,63 +363,81 @@ static std::vector<drop_example> load_drop_json_array_stream(const std::string &
         }
     }
 
-    LOG_INF("%s: loaded %zu DROP examples from %s\n", __func__, examples.size(), filepath.c_str());
+    LOG_INF("%s: loaded %zu SST-2 examples from %s\n", __func__, examples.size(), filepath.c_str());
     return examples;
 }
 
-// Format DROP example for training
-static std::string format_drop_prompt(const drop_example & ex) {
+// Format SST-2 classification prompt.
+static std::string format_sst2_prompt(const sst2_example & ex) {
     std::stringstream ss;
-    ss << "Passage: " << ex.passage << "\n";
-    ss << "Question: " << ex.question << "\n";
-    ss << "Answer: " << ex.answer_span;
+    ss << "You are a strict sentiment classification expert. "
+          "Output ONLY 'positive' or 'negative'. "
+          "Do not output any other text, explanation, or punctuation.\n\n";
+    ss << "Review: " << ex.sentence << "\n";
+    ss << "Sentiment: ";
     return ss.str();
 }
 
-// Convert DROP examples to per-sample token sequences.
-// Each training sample remains independent (no sequence packing).
-static std::vector<std::vector<llama_token>> drop_to_token_sequences(
+// Convert SST-2 examples to per-sample SFT sequences.
+// Prompt and label are tokenized separately to avoid tokenizer boundary quirks.
+static std::vector<sft_sample> sst2_to_sft_sequences(
         struct llama_context * ctx,
-        const std::vector<drop_example> & examples,
+        const std::vector<sst2_example> & examples,
         int max_tokens_per_sample = -1) {
-
-    std::vector<std::vector<llama_token>> tokenized_samples;
-    tokenized_samples.reserve(examples.size());
+    std::vector<sft_sample> dataset;
+    dataset.reserve(examples.size());
     size_t total_tokens = 0;
 
-    LOG_INF("%s: tokenizing %zu DROP examples...\n", __func__, examples.size());
+    const struct llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+
+    LOG_INF("%s: tokenizing %zu SST-2 examples...\n", __func__, examples.size());
 
     for (size_t i = 0; i < examples.size(); ++i) {
         try {
-            std::string prompt = format_drop_prompt(examples[i]);
-            std::vector<llama_token> tokens = common_tokenize(ctx, prompt, true);
-
-            if (max_tokens_per_sample > 0 && tokens.size() > (size_t)max_tokens_per_sample) {
-                tokens.resize(max_tokens_per_sample);
+            const std::string prompt_str = format_sst2_prompt(examples[i]);
+            const std::string answer_str = examples[i].label_str;
+            std::vector<llama_token> prompt_tokens = common_tokenize(ctx, prompt_str, true);
+            std::vector<llama_token> answer_tokens = common_tokenize(ctx, answer_str, false);
+            if (prompt_tokens.empty() || answer_tokens.empty()) {
+                continue;
             }
 
-            total_tokens += tokens.size();
-            tokenized_samples.push_back(std::move(tokens));
+            sft_sample sample;
+            sample.prompt_length = (int) prompt_tokens.size();
+            sample.label_token = answer_tokens[0];
+            sample.tokens = std::move(prompt_tokens);
+            sample.tokens.insert(sample.tokens.end(), answer_tokens.begin(), answer_tokens.end());
+            sample.tokens.push_back(llama_vocab_eos(vocab));
+
+            if (max_tokens_per_sample > 0 && sample.tokens.size() > (size_t)max_tokens_per_sample) {
+                sample.tokens.resize(max_tokens_per_sample);
+            }
+            if ((int)sample.tokens.size() <= sample.prompt_length) {
+                continue;
+            }
+
+            total_tokens += sample.tokens.size();
+            dataset.push_back(std::move(sample));
 
             if ((i + 1) % 10 == 0) {
                 LOG_INF("%s: tokenized %zu/%zu examples (%zu tokens total)\n",
                         __func__, i + 1, examples.size(), total_tokens);
             }
         } catch (const std::exception & e) {
-            LOG_ERR("%s: error tokenizing DROP example %zu: %s\n", __func__, i, e.what());
+            LOG_ERR("%s: error tokenizing SST-2 example %zu: %s\n", __func__, i, e.what());
         }
     }
 
-    LOG_INF("%s: tokenized DROP samples=%zu, total tokens=%zu\n",
-            __func__, tokenized_samples.size(), total_tokens);
+    LOG_INF("%s: tokenized SST-2 samples=%zu, total tokens=%zu\n",
+            __func__, dataset.size(), total_tokens);
 
-    return tokenized_samples;
+    return dataset;
 }
 
-static size_t count_total_tokens(const std::vector<std::vector<llama_token>> & samples) {
+static size_t count_total_tokens(const std::vector<sft_sample> & samples) {
     size_t total = 0;
     for (const auto & sample : samples) {
-        total += sample.size();
+        total += sample.tokens.size();
     }
     return total;
 }
@@ -451,12 +479,12 @@ static int32_t parse_epochs_from_argv(int argc, char ** argv, int32_t fallback) 
     return epochs;
 }
 
-static std::vector<std::vector<llama_token>> filter_short_samples(
-        const std::vector<std::vector<llama_token>> & samples) {
-    std::vector<std::vector<llama_token>> out;
+static std::vector<sft_sample> filter_short_samples(
+        const std::vector<sft_sample> & samples) {
+    std::vector<sft_sample> out;
     out.reserve(samples.size());
     for (const auto & s : samples) {
-        if (s.size() >= 2) {
+        if (s.prompt_length >= 1 && (int)s.tokens.size() > s.prompt_length && s.label_token >= 0) {
             out.push_back(s);
         }
     }
@@ -487,11 +515,11 @@ static void progress_callback(
 }
 
 static bool build_sample_batch(
-        const std::vector<llama_token> & sample_tokens,
+        const sft_sample & sample,
         int n_ctx,
         llama_batch & batch,
         std::vector<radazo_loss_target> & loss_targets) {
-    const int seq_len = std::min((int) sample_tokens.size(), n_ctx);
+    const int seq_len = std::min((int) sample.tokens.size(), n_ctx);
     if (seq_len < 2) {
         return false;
     }
@@ -499,12 +527,15 @@ static bool build_sample_batch(
     batch = llama_batch_init(seq_len, 0, 1);
     loss_targets.clear();
 
-    // Use the second-to-last position to predict the last token (the answer).
-    // Format: "Passage: ...\nQuestion: ...\nAnswer: 3" → last token = answer.
-    const int loss_pos = seq_len - 2;
+    // Single-point classification target:
+    // predict first label token at the position right after prompt.
+    const int loss_pos = sample.prompt_length - 1;
+    if (loss_pos < 0 || loss_pos + 1 >= seq_len) {
+        return false;
+    }
 
     for (int pos = 0; pos < seq_len; ++pos) {
-        batch.token[pos] = sample_tokens[pos];
+        batch.token[pos] = sample.tokens[pos];
         batch.pos[pos] = pos;
         batch.n_seq_id[pos] = 1;
         batch.seq_id[pos][0] = 0;
@@ -512,8 +543,122 @@ static bool build_sample_batch(
     }
     batch.n_tokens = seq_len;
 
-    loss_targets.push_back({loss_pos, sample_tokens[loss_pos + 1], 1.0f});
+    loss_targets.push_back({loss_pos, sample.tokens[loss_pos + 1], 1.0f});
     return true;
+}
+
+static float evaluate_sst2_accuracy(
+        struct llama_context * ctx,
+        const std::vector<sft_sample> & eval_samples,
+        int n_ctx) {
+    if (eval_samples.empty()) {
+        return 0.0f;
+    }
+
+    std::vector<llama_token> pos_toks = common_tokenize(ctx, "positive", false);
+    std::vector<llama_token> neg_toks = common_tokenize(ctx, "negative", false);
+    if (pos_toks.empty() || neg_toks.empty()) {
+        return 0.0f;
+    }
+    const llama_token pos_tok = pos_toks[0];
+    const llama_token neg_tok = neg_toks[0];
+
+    int64_t correct = 0;
+    int64_t total = 0;
+    for (const auto & sample : eval_samples) {
+        const int prompt_len = std::min(sample.prompt_length, n_ctx);
+        if (prompt_len < 1 || sample.label_token < 0) {
+            continue;
+        }
+
+        llama_batch batch = llama_batch_init(prompt_len, 0, 1);
+        for (int pos = 0; pos < prompt_len; ++pos) {
+            batch.token[pos] = sample.tokens[pos];
+            batch.pos[pos] = pos;
+            batch.n_seq_id[pos] = 1;
+            batch.seq_id[pos][0] = 0;
+            batch.logits[pos] = (pos == prompt_len - 1);
+        }
+        batch.n_tokens = prompt_len;
+
+        llama_memory_seq_rm(llama_get_memory(ctx), -1, -1, -1);
+        llama_synchronize(ctx);
+        if (llama_decode(ctx, batch) == 0) {
+            float * logits = llama_get_logits_ith(ctx, prompt_len - 1);
+            if (logits != nullptr) {
+                const bool pred_pos = logits[pos_tok] > logits[neg_tok];
+                const bool true_pos = sample.label_token == pos_tok;
+                if (pred_pos == true_pos) {
+                    correct++;
+                }
+                total++;
+            }
+        }
+        llama_batch_free(batch);
+    }
+
+    return total > 0 ? (float)correct / (float)total : 0.0f;
+}
+
+static void run_sst2_train_sanity_check(
+        struct llama_context * ctx,
+        const std::vector<sft_sample> & train_samples,
+        int n_ctx) {
+    if (train_samples.empty()) {
+        LOG_WRN("%s: skip sanity check (empty train set)\n", __func__);
+        return;
+    }
+
+    const auto & sample = train_samples[0];
+    const int prompt_len = std::min(sample.prompt_length, n_ctx);
+    if (prompt_len < 1 || (int)sample.tokens.size() <= prompt_len) {
+        LOG_WRN("%s: skip sanity check (invalid sample shape)\n", __func__);
+        return;
+    }
+
+    std::vector<llama_token> pos_toks = common_tokenize(ctx, "positive", false);
+    std::vector<llama_token> neg_toks = common_tokenize(ctx, "negative", false);
+    if (pos_toks.empty() || neg_toks.empty()) {
+        LOG_WRN("%s: skip sanity check (failed to tokenize labels)\n", __func__);
+        return;
+    }
+    const llama_token pos_tok = pos_toks[0];
+    const llama_token neg_tok = neg_toks[0];
+
+    llama_batch batch = llama_batch_init(prompt_len, 0, 1);
+    for (int i = 0; i < prompt_len; ++i) {
+        batch.token[i] = sample.tokens[i];
+        batch.pos[i] = i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = (i == prompt_len - 1);
+    }
+    batch.n_tokens = prompt_len;
+
+    llama_memory_seq_rm(llama_get_memory(ctx), -1, -1, -1);
+    llama_synchronize(ctx);
+
+    LOG_INF("\n=== training-end sanity check (sample 0) ===\n");
+    if (llama_decode(ctx, batch) != 0) {
+        LOG_ERR("%s: sanity decode failed\n", __func__);
+        llama_batch_free(batch);
+        return;
+    }
+
+    float * logits = llama_get_logits_ith(ctx, prompt_len - 1);
+    if (logits == nullptr) {
+        LOG_ERR("%s: sanity logits are null\n", __func__);
+        llama_batch_free(batch);
+        return;
+    }
+
+    const llama_token target_tok = sample.tokens[prompt_len];
+    LOG_INF("%s: target token=%d, positive token=%d, negative token=%d\n",
+            __func__, target_tok, pos_tok, neg_tok);
+    LOG_INF("%s: logits -> positive=%.6f, negative=%.6f, target=%.6f\n",
+            __func__, logits[pos_tok], logits[neg_tok], logits[target_tok]);
+
+    llama_batch_free(batch);
 }
 
 // ========================================
@@ -522,8 +667,8 @@ static bool build_sample_batch(
 
 static void finetune_radazo_quant(
         struct llama_context * ctx,
-        const std::vector<std::vector<llama_token>> & train_samples,
-        const std::vector<std::vector<llama_token>> & /* eval_samples */,
+        const std::vector<sft_sample> & train_samples,
+        const std::vector<sft_sample> & eval_samples,
         RAdaZOOptimizer & optimizer,
         LoRAAdapter & lora_adapter,
         int n_epochs) {
@@ -578,6 +723,10 @@ static void finetune_radazo_quant(
         fprintf(stderr, "\n");
         LOG_INF("%s: Epoch %d complete - Avg Loss: %.6f, samples=%ld\n",
                 __func__, epoch + 1, n_done > 0 ? epoch_loss_sum / n_done : 0.0f, n_done);
+        if (!eval_samples.empty()) {
+            const float acc = evaluate_sst2_accuracy(ctx, eval_samples, n_ctx);
+            LOG_INF("%s: Epoch %d validation accuracy: %.2f%%\n", __func__, epoch + 1, acc * 100.0f);
+        }
         append_memory_log_train("epoch_end", epoch + 1, n_done, 0);
     }
 
@@ -614,41 +763,41 @@ int main(int argc, char ** argv) {
 
     training_config train_config;
 
-    // Default DROP dataset paths (try multiple locations)
-    std::string drop_train_file;
+    // Default SST-2 dataset paths (try multiple locations)
+    std::string sst2_train_file;
     std::vector<std::string> possible_train_paths = {
-        "examples/zeroth-order-opt/drop_train.json",
-        "../examples/zeroth-order-opt/drop_train.json",
-        "../../examples/zeroth-order-opt/drop_train.json",
-        "../../../examples/zeroth-order-opt/drop_train.json"
+        "examples/zeroth-order-opt/sst2_train.json",
+        "../examples/zeroth-order-opt/sst2_train.json",
+        "../../examples/zeroth-order-opt/sst2_train.json",
+        "../../../examples/zeroth-order-opt/sst2_train.json"
     };
     for (const auto & path : possible_train_paths) {
         std::ifstream test_file(path);
         if (test_file.good()) {
-            drop_train_file = path;
+            sst2_train_file = path;
             break;
         }
     }
-    if (drop_train_file.empty()) {
-        drop_train_file = possible_train_paths[0];
+    if (sst2_train_file.empty()) {
+        sst2_train_file = possible_train_paths[0];
     }
 
-    std::string drop_validation_file;
+    std::string sst2_validation_file;
     std::vector<std::string> possible_validation_paths = {
-        "examples/zeroth-order-opt/drop_validation.json",
-        "../examples/zeroth-order-opt/drop_validation.json",
-        "../../examples/zeroth-order-opt/drop_validation.json",
-        "../../../examples/zeroth-order-opt/drop_validation.json"
+        "examples/zeroth-order-opt/sst2_test.json",
+        "../examples/zeroth-order-opt/sst2_test.json",
+        "../../examples/zeroth-order-opt/sst2_test.json",
+        "../../../examples/zeroth-order-opt/sst2_test.json"
     };
     for (const auto & path : possible_validation_paths) {
         std::ifstream test_file(path);
         if (test_file.good()) {
-            drop_validation_file = path;
+            sst2_validation_file = path;
             break;
         }
     }
-    if (drop_validation_file.empty()) {
-        drop_validation_file = possible_validation_paths[0];
+    if (sst2_validation_file.empty()) {
+        sst2_validation_file = possible_validation_paths[0];
     }
 
     bool save_lora_only = false;
@@ -734,44 +883,45 @@ int main(int argc, char ** argv) {
     }
 
     // Training configuration
-    train_config.max_train_samples = 10;
-    train_config.max_eval_samples = 10;
+    train_config.max_train_samples = 100;
+    train_config.max_eval_samples = 100;
     train_config.max_tokens_per_sample = 512;
 
-    // Load DROP train/validation datasets
-    LOG_INF("%s: Loading DROP train dataset from: %s\n", __func__, drop_train_file.c_str());
-    auto drop_train_examples = load_drop_json_array_stream(drop_train_file, train_config.max_train_samples);
+    // Load SST-2 train/validation datasets
+    LOG_INF("%s: Loading SST-2 train dataset from: %s\n", __func__, sst2_train_file.c_str());
+    auto sst2_train_examples = load_sst2_json_array_stream(sst2_train_file, train_config.max_train_samples);
 
-    if (drop_train_examples.empty()) {
-        LOG_ERR("%s: failed to load DROP train examples\n", __func__);
+    if (sst2_train_examples.empty()) {
+        LOG_ERR("%s: failed to load SST-2 train examples\n", __func__);
         return 1;
     }
 
-    LOG_INF("%s: Loading DROP validation dataset from: %s\n", __func__, drop_validation_file.c_str());
-    auto drop_validation_examples = load_drop_json_array_stream(drop_validation_file, train_config.max_eval_samples);
-    LOG_INF("%s: Loaded DROP examples - train=%zu, validation=%zu\n",
-            __func__, drop_train_examples.size(), drop_validation_examples.size());
+    LOG_INF("%s: Loading SST-2 validation dataset from: %s\n", __func__, sst2_validation_file.c_str());
+    auto sst2_validation_examples = load_sst2_json_array_stream(sst2_validation_file, train_config.max_eval_samples);
+    LOG_INF("%s: Loaded SST-2 examples - train=%zu, validation=%zu\n",
+            __func__, sst2_train_examples.size(), sst2_validation_examples.size());
 
     // Show first example
-    if (!drop_train_examples.empty()) {
+    if (!sst2_train_examples.empty()) {
         LOG_INF("%s: First training example:\n", __func__);
         LOG_INF("%s: ----------------------------------------\n", __func__);
-        LOG_INF("%s: %s\n", __func__, format_drop_prompt(drop_train_examples[0]).c_str());
+        LOG_INF("%s: %s\n", __func__, format_sst2_prompt(sst2_train_examples[0]).c_str());
+        LOG_INF("%s: Label: %s\n", __func__, sst2_train_examples[0].label_str.c_str());
         LOG_INF("%s: ----------------------------------------\n\n", __func__);
     }
 
-    // Tokenize DROP train examples as independent sequences (no packing).
-    std::vector<std::vector<llama_token>> train_set = drop_to_token_sequences(
-        ctx.get(), drop_train_examples, train_config.max_tokens_per_sample);
+    // Tokenize SST-2 train examples as independent sequences (no packing).
+    std::vector<sft_sample> train_set = sst2_to_sft_sequences(
+        ctx.get(), sst2_train_examples, train_config.max_tokens_per_sample);
     train_set = filter_short_samples(train_set);
     if (train_set.empty()) {
-        LOG_ERR("%s: tokenized DROP train dataset is empty\n", __func__);
+        LOG_ERR("%s: tokenized SST-2 train dataset is empty\n", __func__);
         return 1;
     }
 
-    // Tokenize DROP validation examples for eval bookkeeping.
-    std::vector<std::vector<llama_token>> eval_set = drop_to_token_sequences(
-        ctx.get(), drop_validation_examples, train_config.max_tokens_per_sample);
+    // Tokenize SST-2 validation examples for eval bookkeeping.
+    std::vector<sft_sample> eval_set = sst2_to_sft_sequences(
+        ctx.get(), sst2_validation_examples, train_config.max_tokens_per_sample);
     eval_set = filter_short_samples(eval_set);
 
     LOG_INF("%s: train_samples=%zu (%zu tokens), eval_samples=%zu (%zu tokens)\n\n",
@@ -806,7 +956,7 @@ int main(int argc, char ** argv) {
     radazo_config.beta1    = 0.9f;
     radazo_config.beta2    = 0.999f;
     radazo_config.eps      = 1e-8f;
-    radazo_config.mu       = 1e-4f;
+    radazo_config.mu       = 1e-3f;
     radazo_config.n_samples = 1;   // global SPSA draws per sample (each = 2 forward passes)
     radazo_config.log_gradients = true;
 
@@ -831,6 +981,10 @@ int main(int argc, char ** argv) {
     // Run fine-tuning
     int n_epochs = parse_epochs_from_argv(argc, argv, 1);
     finetune_radazo_quant(ctx.get(), train_set, eval_set, optimizer, lora_adapter, n_epochs);
+
+    // Post-training check: inspect logits on one memorized train sample
+    // before saving, to verify train-time behavior inside this process.
+    run_sst2_train_sanity_check(ctx.get(), train_set, llama_n_ctx(ctx.get()));
 
     // Save: either merge into base model, or export standalone FP32 LoRA (Phase 3 verification).
     std::string output_file = params.out_file.empty() ?
@@ -874,9 +1028,9 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: save completed successfully!\n", __func__);
     LOG_INF("\n%s: ===== SUMMARY =====\n", __func__);
     LOG_INF("%s: Method: LoRA + R-AdaZO (quantized base model)\n", __func__);
-    LOG_INF("%s: Dataset: DROP (passage/question/answer span)\n", __func__);
-    LOG_INF("%s: Loaded train examples: %zu\n", __func__, drop_train_examples.size());
-    LOG_INF("%s: Loaded validation examples: %zu\n", __func__, drop_validation_examples.size());
+    LOG_INF("%s: Dataset: SST-2 (binary sentiment classification)\n", __func__);
+    LOG_INF("%s: Loaded train examples: %zu\n", __func__, sst2_train_examples.size());
+    LOG_INF("%s: Loaded validation examples: %zu\n", __func__, sst2_validation_examples.size());
     LOG_INF("%s: Epochs: %d\n", __func__, n_epochs);
     LOG_INF("%s: Training samples: %zu\n", __func__, train_set.size());
     LOG_INF("%s: Training tokens: %zu\n", __func__, count_total_tokens(train_set));

@@ -85,11 +85,15 @@ cmake --build . --config Debug --target finetune-radazo-quant
 
 ./llama-simple-chat -m /root/autodl-tmp/llama.cpp/Qwen3_Q4_K_M_finetuned.gguf -c 2048
 
-./bin/llama-server -m /root/.cache/huggingface/hub/models--Qwen--Qwen3-8B-GGUF/snapshots/7c41481f57cb95916b40956ab2f0b139b296d974/Qwen3-8B-Q4_K_M.gguf -c 4096 --port 8080
+./bin/llama-server -m /root/.cache/huggingface/hub/models--Qwen--Qwen3-8B-GGUF/snapshots/7c41481f57cb95916b40956ab2f0b139b296d974/Qwen3-8B-Q4_K_M.gguf -c 2048 --port 8080
 
-./bin/llama-server -m /root/autodl-tmp/llama.cpp/Qwen3_Q4_K_M_finetuned_1.gguf -c 4096 --port 8080
+./bin/llama-server -m /root/autodl-tmp/llama.cpp/Qwen3_Q4_K_M_finetuned_1.gguf -c 2048 --port 8080
 
-./bin/finetune-radazo-quant   -m /root/.cache/huggingface/hub/models--Qwen--Qwen3-8B-GGUF/snapshots/7c41481f57cb95916b40956ab2f0b139b296d974/Qwen3-8B-Q4_K_M.gguf   -f /root/autodl-tmp/llama.cpp/examples/zeroth-order-opt/drop_train.json -o /root/autodl-tmp/llama.cpp/Qwen3_Q4_K_M_finetuned_1.gguf  --epochs 1
+./bin/finetune-radazo-quant   -m /root/.cache/huggingface/hub/models--Qwen--Qwen3-8B-GGUF/snapshots/7c41481f57cb95916b40956ab2f0b139b296d974/Qwen3-8B-Q4_K_M.gguf   -f /root/autodl-tmp/llama.cpp/examples/zeroth-order-opt/drop_train.json -o /root/autodl-tmp/llama.cpp/Qwen3_Q4_K_M_finetuned_1.gguf  --epochs 20
 
-./bin/llama-server -m /root/autodl-tmp/llama.cpp/build/model_radazo_finetuned.gguf -c 4096 --port 8080
-./bin/llama-server -m /root/autodl-tmp/llama.cpp/model_radazo_finetuned.gguf -c 4096 --port 8080
+./bin/llama-server -m /root/autodl-tmp/llama.cpp/build/model_radazo_finetuned.gguf -c 2048 --port 8080
+./bin/llama-server -m /root/autodl-tmp/llama.cpp/model_radazo_finetuned.gguf -c 2048 --port 8080
+
+./bin/llama-cli -m /root/.cache/huggingface/hub/models--Qwen--Qwen3-8B-GGUF/snapshots/7c41481f57cb95916b40956ab2f0b139b296d974/Qwen3-8B-Q4_K_M.gguf --lora /root/autodl-tmp/llama.cpp/lora_fp32.gguf -p "To start the season, the Lions traveled south to Tampa, Florida to take on the Tampa Bay Buccaneers. The Lions scored first in the first quarter with a 23-yard field goal by Jason Hanson. The Buccaneers tied it up with a 38-yard field goal by Connor Barth, then took the lead when Aqib Talib intercepted a pass from Matthew Stafford and ran it in 28 yards. The Lions responded with a 28-yard field goal. In the second quarter, Detroit took the lead with a 36-yard touchdown catch by Calvin Johnson, and later added more points when Tony Scheffler caught an 11-yard TD pass. Tampa Bay responded with a 31-yard field goal just before halftime. The second half was relatively quiet, with each team only scoring one touchdown. First, Detroit's Calvin Johnson caught a 1-yard pass in the third quarter. The game's final points came when Mike Williams of Tampa Bay caught a 5-yard pass.  The Lions won their regular season opener for the first time since 2007. How many points did the buccaneers need to tie in the first?"
+
+./bin/llama-cli -m /root/.cache/huggingface/hub/models--Qwen--Qwen3-8B-GGUF/snapshots/7c41481f57cb95916b40956ab2f0b139b296d974/Qwen3-8B-Q4_K_M.gguf -p "To start the season, the Lions traveled south to Tampa, Florida to take on the Tampa Bay Buccaneers. The Lions scored first in the first quarter with a 23-yard field goal by Jason Hanson. The Buccaneers tied it up with a 38-yard field goal by Connor Barth, then took the lead when Aqib Talib intercepted a pass from Matthew Stafford and ran it in 28 yards. The Lions responded with a 28-yard field goal. In the second quarter, Detroit took the lead with a 36-yard touchdown catch by Calvin Johnson, and later added more points when Tony Scheffler caught an 11-yard TD pass. Tampa Bay responded with a 31-yard field goal just before halftime. The second half was relatively quiet, with each team only scoring one touchdown. First, Detroit's Calvin Johnson caught a 1-yard pass in the third quarter. The game's final points came when Mike Williams of Tampa Bay caught a 5-yard pass.  The Lions won their regular season opener for the first time since 2007. How many points did the buccaneers need to tie in the first?"

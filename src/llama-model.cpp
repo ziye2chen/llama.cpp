@@ -2382,8 +2382,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     std::regex pattern(overrides->pattern);
                     if (std::regex_search(tensor_name, pattern)) {
                         if (overrides->buft == ggml_backend_cpu_buffer_type()) {
-                            // when overriding to a CPU buffer, consider the extra buffer types
-                            buft = select_weight_buft(hparams, t_meta, op, pimpl->cpu_buft_list);
+                            // Use plain CPU directly (not select_weight_buft) so get_tensor works.
+                            // AMX buffer has get_tensor=nullptr and would segfault during merge/finetune.
+                            buft = overrides->buft;
                         } else {
                             buft = overrides->buft;
                         }

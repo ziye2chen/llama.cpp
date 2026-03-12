@@ -37,6 +37,10 @@ RAdaZOOptimizer::RAdaZOOptimizer(
     , rng_(params.random_seed) {
     // Build one-time CPU master copies for all trainable tensors.
     for (struct ggml_tensor * p : trainable_params_) {
+        if (!p || !p->buffer) {
+            LOG_ERR("%s: skipping tensor with no buffer\n", __func__);
+            continue;
+        }
         const int64_t n = ggml_nelements(p);
         std::vector<float> host((size_t) n, 0.0f);
         ggml_backend_tensor_get(p, host.data(), 0, n * sizeof(float));

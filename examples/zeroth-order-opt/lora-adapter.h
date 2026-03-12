@@ -73,6 +73,9 @@ public:
     // Merge trained LoRA into base model weights and write a new GGUF file.
     bool merge_and_save(struct llama_model * model, const std::string & output_path) const;
 
+    // Save LoRA adapters as standalone FP32 GGUF (no merge). Use with --lora at inference.
+    bool save_lora_standalone(struct llama_model * model, const std::string & output_path) const;
+
     // Return all trainable FP32 tensors (alternating A, B per layer).
     std::vector<struct ggml_tensor *> get_trainable_params() const;
 

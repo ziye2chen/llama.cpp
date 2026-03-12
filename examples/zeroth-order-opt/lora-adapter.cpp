@@ -8,12 +8,14 @@
 #include "log.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
+#include "gguf.h"
 
 #include <cmath>
 #include <algorithm>
 #include <fstream>
 #include <random>
 #include <cstring>
+#include <cstdio>
 #include <string>
 #include <unordered_set>
 #include <unordered_map>
@@ -197,15 +199,15 @@ bool LoRAAdapter::initialize() {
     }
     LOG_INF("%s: created %zu LoRA adapters\n", __func__, created);
 
-    // Allocate GPU buffers for A/B (same device as model weights so that
-    // ggml does not need cross-device copies during build_lora_mm).
+    // Allocate buffers for A/B. Use CPU buffer type so ggml_backend_tensor_get/set work
+    // (AMX buffer has get_tensor=nullptr and would segfault when R-AdaZO reads master copy).
     {
         auto first_base = lora_layers_.begin()->second.base_tensor;
         if (!first_base->buffer) {
             LOG_ERR("%s: base tensor has no buffer\n", __func__);
             return false;
         }
-        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(first_base->buffer);
+        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(lora_ctx_, buft);
         if (!buf) {
             LOG_ERR("%s: failed to allocate backend buffer for LoRA tensors\n", __func__);
@@ -301,9 +303,25 @@ bool LoRAAdapter::merge_and_save(
     LOG_INF("%s: merging %zu LoRA layers into base model...\n",
             __func__, lora_layers_.size());
 
+    // Resolve merge targets from the provided model by tensor name.
+    std::unordered_map<std::string, struct ggml_tensor *> base_by_name;
+    base_by_name.reserve(llama_model_n_tensors(model));
+    char tname[256];
+    for (size_t i = 0; i < llama_model_n_tensors(model); ++i) {
+        struct ggml_tensor * t = llama_model_get_tensor_by_index(model, i, tname, sizeof(tname));
+        if (t) {
+            base_by_name[std::string(tname)] = t;
+        }
+    }
+
     for (const auto & kv : lora_layers_) {
         const lora_layer & layer = kv.second;
-        struct ggml_tensor * base = layer.base_tensor;
+        auto it_base = base_by_name.find(layer.name);
+        if (it_base == base_by_name.end()) {
+            LOG_WRN("%s: skip %s (tensor not found in merge model)\n", __func__, layer.name.c_str());
+            continue;
+        }
+        struct ggml_tensor * base = it_base->second;
         if (!base || !base->buffer) {
             LOG_WRN("%s: skip %s (no base tensor)\n", __func__, layer.name.c_str());
             continue;
@@ -320,6 +338,20 @@ bool LoRAAdapter::merge_and_save(
         build_lora_delta(layer, a_data, b_data, delta);
 
         const enum ggml_type qtype = base->type;
+
+        if (ggml_is_quantized(qtype)) {
+            // ---- Phase 1: Double Quantization Loss diagnostic probes ----
+            float delta_max_abs = 0.0f;
+            double delta_sum_abs = 0.0;
+            for (float v : delta) {
+                const float a = std::abs(v);
+                delta_max_abs = std::max(delta_max_abs, a);
+                delta_sum_abs += (double)a;
+            }
+            const float delta_mean_abs = (float)(delta_sum_abs / (delta.empty() ? 1 : delta.size()));
+            LOG_INF("%s: [Probe A] %s delta: max_abs=%.6e mean_abs=%.6e (ZO updates may be below Q4 bucket size)\n",
+                    __func__, layer.name.c_str(), delta_max_abs, delta_mean_abs);
+        }
 
         if (!ggml_is_quantized(qtype)) {
             // FP32 path
@@ -352,14 +384,43 @@ bool LoRAAdapter::merge_and_save(
         llama_synchronize(ctx_);
 
         std::vector<float> row_f32((size_t)n_per_row);
+        std::vector<uint8_t> row_before_quant(row_size);
+        int64_t n_blocks_changed = 0;
+        const int64_t probe_b_rows = (nrows > 0) ? 1 : 0;  // first row only for Probe B
+
         for (int64_t ir = 0; ir < nrows; ++ir) {   // ir = out_dim index
             void * quant_row = quant_data.data() + (size_t)ir * row_size;
             traits->to_float(quant_row, row_f32.data(), n_per_row);
+
+            if (ir < probe_b_rows) {
+                LOG_INF("%s: [Probe B] %s row %ld BEFORE+delta: first 10 fp32 = ", __func__, layer.name.c_str(), ir);
+                for (int64_t ic = 0; ic < std::min(10L, n_per_row); ++ic) {
+                    fprintf(stderr, "%.6e ", row_f32[(size_t)ic]);
+                }
+                fprintf(stderr, "\n");
+            }
+
             for (int64_t ic = 0; ic < n_per_row; ++ic) {  // ic = in_dim index
                 row_f32[(size_t)ic] += delta[(size_t)(ir * n_per_row + ic)];
             }
+
+            if (ir < probe_b_rows) {
+                LOG_INF("%s: [Probe B] %s row %ld AFTER+delta: first 10 fp32 = ", __func__, layer.name.c_str(), ir);
+                for (int64_t ic = 0; ic < std::min(10L, n_per_row); ++ic) {
+                    fprintf(stderr, "%.6e ", row_f32[(size_t)ic]);
+                }
+                fprintf(stderr, "\n");
+            }
+
+            std::memcpy(row_before_quant.data(), quant_row, row_size);
             traits->from_float_ref(row_f32.data(), quant_row, n_per_row);
+            if (std::memcmp(row_before_quant.data(), quant_row, row_size) != 0) {
+                n_blocks_changed++;
+            }
         }
+
+        LOG_INF("%s: [Probe C] %s: %ld/%ld rows changed after requant (0%% = all wiped by rounding)\n",
+                __func__, layer.name.c_str(), n_blocks_changed, nrows);
 
         ggml_backend_tensor_set(base, quant_data.data(), 0, nbytes);
         llama_synchronize(ctx_);
@@ -372,6 +433,97 @@ bool LoRAAdapter::merge_and_save(
     llama_model_save_to_file(model, output_path.c_str());
     LOG_INF("%s: model saved successfully with LoRA merged!\n", __func__);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// save_lora_standalone
+// Export LoRA A/B as standalone FP32 GGUF for inference with --lora (no merge).
+// Use to verify ZO training: if FP32 LoRA changes output vs baseline, merge
+// requantization was wiping updates.
+// ---------------------------------------------------------------------------
+
+bool LoRAAdapter::save_lora_standalone(
+        struct llama_model * model,
+        const std::string  & output_path) const {
+    if (!model) { LOG_ERR("%s: null model\n", __func__); return false; }
+
+    LOG_INF("%s: saving %zu LoRA layers as standalone FP32 adapter to %s\n",
+            __func__, lora_layers_.size(), output_path.c_str());
+
+    struct gguf_context * ctx_gguf = gguf_init_empty();
+    if (!ctx_gguf) {
+        LOG_ERR("%s: failed to create GGUF context\n", __func__);
+        return false;
+    }
+
+    gguf_set_val_str(ctx_gguf, "general.type", "adapter");
+    char arch_buf[64];
+    if (llama_model_meta_val_str(model, "general.architecture", arch_buf, sizeof(arch_buf)) > 0) {
+        gguf_set_val_str(ctx_gguf, "general.architecture", arch_buf);
+    } else {
+        gguf_set_val_str(ctx_gguf, "general.architecture", "unknown");
+    }
+    gguf_set_val_str(ctx_gguf, "adapter.type", "lora");
+    gguf_set_val_f32(ctx_gguf, "adapter.lora.alpha", config_.alpha);
+
+    ggml_init_params meta_params = { ggml_tensor_overhead() * lora_layers_.size() * 2, nullptr, true };
+    struct ggml_context * ctx_meta = ggml_init(meta_params);
+    if (!ctx_meta) {
+        gguf_free(ctx_gguf);
+        LOG_ERR("%s: failed to create meta context\n", __func__);
+        return false;
+    }
+
+    std::vector<std::vector<float>> data_buffers;
+    data_buffers.reserve(lora_layers_.size() * 2);
+
+    for (const auto & kv : lora_layers_) {
+        const lora_layer & layer = kv.second;
+        const std::string name_a = layer.name + ".lora_a";
+        const std::string name_b = layer.name + ".lora_b";
+
+        struct ggml_tensor * t_a = ggml_new_tensor_2d(ctx_meta, GGML_TYPE_F32,
+                layer.lora_A->ne[0], layer.lora_A->ne[1]);
+        struct ggml_tensor * t_b = ggml_new_tensor_2d(ctx_meta, GGML_TYPE_F32,
+                layer.lora_B->ne[0], layer.lora_B->ne[1]);
+        ggml_set_name(t_a, name_a.c_str());
+        ggml_set_name(t_b, name_b.c_str());
+
+        gguf_add_tensor(ctx_gguf, t_a);
+        gguf_add_tensor(ctx_gguf, t_b);
+
+        data_buffers.emplace_back(ggml_nelements(layer.lora_A));
+        data_buffers.emplace_back(ggml_nelements(layer.lora_B));
+
+        ggml_backend_tensor_get(layer.lora_A, data_buffers[data_buffers.size() - 2].data(),
+                0, data_buffers[data_buffers.size() - 2].size() * sizeof(float));
+        ggml_backend_tensor_get(layer.lora_B, data_buffers[data_buffers.size() - 1].data(),
+                0, data_buffers[data_buffers.size() - 1].size() * sizeof(float));
+    }
+    llama_synchronize(ctx_);
+
+    size_t buf_idx = 0;
+    for (const auto & kv : lora_layers_) {
+        const lora_layer & layer = kv.second;
+        gguf_set_tensor_data(ctx_gguf, (layer.name + ".lora_a").c_str(),
+                data_buffers[buf_idx].data());
+        buf_idx++;
+        gguf_set_tensor_data(ctx_gguf, (layer.name + ".lora_b").c_str(),
+                data_buffers[buf_idx].data());
+        buf_idx++;
+    }
+
+    bool ok = gguf_write_to_file(ctx_gguf, output_path.c_str(), false);
+    ggml_free(ctx_meta);
+    gguf_free(ctx_gguf);
+
+    if (ok) {
+        LOG_INF("%s: LoRA adapter saved. Test with: ./llama-cli -m base.gguf --lora %s -p \"...\"\n",
+                __func__, output_path.c_str());
+    } else {
+        LOG_ERR("%s: failed to write GGUF to %s\n", __func__, output_path.c_str());
+    }
+    return ok;
 }
 
 // ---------------------------------------------------------------------------

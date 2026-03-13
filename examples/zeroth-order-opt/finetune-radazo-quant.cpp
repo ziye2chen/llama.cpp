@@ -221,6 +221,7 @@ struct training_config {
     int32_t max_train_samples = 10;
     int32_t max_eval_samples = 10;
     int32_t max_tokens_per_sample = 512;
+    int32_t train_batch_size = 8;
 };
 
 // SST-2 data structure
@@ -479,6 +480,43 @@ static int32_t parse_epochs_from_argv(int argc, char ** argv, int32_t fallback) 
     return epochs;
 }
 
+static int32_t estimate_packed_batch_count(
+        const std::vector<sft_sample> & samples,
+        int total_token_budget,
+        int per_seq_ctx,
+        int max_seqs_per_batch) {
+    if (samples.empty()) {
+        return 0;
+    }
+
+    int32_t count = 0;
+    size_t i = 0;
+    while (i < samples.size()) {
+        int used_tokens = 0;
+        int used_seqs = 0;
+
+        while (i < samples.size() && used_seqs < max_seqs_per_batch) {
+            const int seq_len = std::min((int) samples[i].tokens.size(), per_seq_ctx);
+            if (seq_len < 2 || samples[i].prompt_length >= seq_len) {
+                ++i;
+                continue;
+            }
+            if (used_seqs > 0 && used_tokens + seq_len > total_token_budget) {
+                break;
+            }
+            used_tokens += seq_len;
+            used_seqs++;
+            ++i;
+        }
+
+        if (used_seqs > 0) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
 static std::vector<sft_sample> filter_short_samples(
         const std::vector<sft_sample> & samples) {
     std::vector<sft_sample> out;
@@ -489,6 +527,71 @@ static std::vector<sft_sample> filter_short_samples(
         }
     }
     return out;
+}
+
+static bool build_packed_batch(
+        const std::vector<sft_sample> & samples,
+        size_t start_idx,
+        int total_token_budget,
+        int per_seq_ctx,
+        int max_seqs_per_batch,
+        llama_batch & batch,
+        std::vector<radazo_loss_target> & loss_targets,
+        size_t & next_idx,
+        int & packed_samples) {
+    std::vector<std::pair<size_t, int>> selected;
+    selected.reserve(max_seqs_per_batch);
+
+    int total_tokens = 0;
+    next_idx = start_idx;
+    packed_samples = 0;
+    loss_targets.clear();
+
+    for (size_t i = start_idx; i < samples.size() && packed_samples < max_seqs_per_batch; ++i) {
+        const int seq_len = std::min((int) samples[i].tokens.size(), per_seq_ctx);
+        if (seq_len < 2 || samples[i].prompt_length >= seq_len) {
+            next_idx = i + 1;
+            continue;
+        }
+
+        if (packed_samples > 0 && total_tokens + seq_len > total_token_budget) {
+            break;
+        }
+
+        selected.push_back({ i, seq_len });
+        total_tokens += seq_len;
+        packed_samples++;
+        next_idx = i + 1;
+    }
+
+    if (selected.empty()) {
+        return false;
+    }
+
+    batch = llama_batch_init(total_tokens, 0, packed_samples);
+    int batch_pos = 0;
+
+    for (int seq_id = 0; seq_id < packed_samples; ++seq_id) {
+        const auto & item = selected[(size_t) seq_id];
+        const sft_sample & sample = samples[item.first];
+        const int seq_len = item.second;
+        const int loss_pos = sample.prompt_length - 1;
+
+        for (int pos = 0; pos < seq_len; ++pos) {
+            batch.token[batch_pos] = sample.tokens[(size_t) pos];
+            batch.pos[batch_pos] = pos;
+            batch.n_seq_id[batch_pos] = 1;
+            batch.seq_id[batch_pos][0] = seq_id;
+            batch.logits[batch_pos] = (pos == loss_pos);
+            if (pos == loss_pos) {
+                loss_targets.push_back({ batch_pos, sample.tokens[(size_t) loss_pos + 1], 1.0f });
+            }
+            batch_pos++;
+        }
+    }
+
+    batch.n_tokens = batch_pos;
+    return true;
 }
 
 // Progress callback with CPU and memory monitoring
@@ -671,20 +774,28 @@ static void finetune_radazo_quant(
         const std::vector<sft_sample> & eval_samples,
         RAdaZOOptimizer & optimizer,
         LoRAAdapter & lora_adapter,
-        int n_epochs) {
+        int n_epochs,
+        int train_batch_size) {
     (void) lora_adapter;
 
     LOG_INF("\n%s: starting R-AdaZO fine-tuning (QLoRA A/B only)...\n", __func__);
 
     const int n_ctx = llama_n_ctx(ctx);
+    const int n_seq_max = (int) llama_n_seq_max(ctx);
+    const int n_ctx_per_seq = std::max(1, n_ctx / std::max(1, n_seq_max));
+    const int token_budget = std::min(n_ctx, (int) llama_n_batch(ctx));
     const struct llama_model * model_ptr = llama_get_model(ctx);
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_ptr));
 
-    LOG_INF("%s: n_ctx=%d, n_train_samples=%zu, n_epochs=%d\n",
-            __func__, n_ctx, train_samples.size(), n_epochs);
+    LOG_INF("%s: n_ctx=%d, n_seq_max=%d, n_ctx_per_seq=%d, token_budget=%d, train_batch_size=%d, n_train_samples=%zu, n_epochs=%d\n",
+            __func__, n_ctx, n_seq_max, n_ctx_per_seq, token_budget, train_batch_size, train_samples.size(), n_epochs);
 
     cpu_usage_tracker cpu_tracker;
-    const int64_t iters_per_epoch = (int64_t) train_samples.size();
+    const int64_t iters_per_epoch = estimate_packed_batch_count(
+            train_samples,
+            token_budget,
+            n_ctx_per_seq,
+            std::min(train_batch_size, n_seq_max));
 
     // Native llama_adapter_lora is already registered in lora_adapter.initialize().
     // llama_decode() automatically applies LoRA via the compute graph.
@@ -696,33 +807,47 @@ static void finetune_radazo_quant(
 
         const int64_t t_epoch_start = ggml_time_us();
         int64_t n_done = 0;
+        int64_t n_samples_done = 0;
         float epoch_loss_sum = 0.0f;
 
-        for (size_t si = 0; si < train_samples.size(); ++si) {
+        for (size_t si = 0; si < train_samples.size();) {
             llama_batch batch = {};
             std::vector<radazo_loss_target> loss_targets;
+            size_t next_si = si;
+            int packed_samples = 0;
 
-            if (!build_sample_batch(train_samples[si], n_ctx, batch, loss_targets)) {
-                LOG_ERR("%s: sample %zu too short, skipping\n", __func__, si);
-                continue;
+            if (!build_packed_batch(
+                    train_samples,
+                    si,
+                    token_budget,
+                    n_ctx_per_seq,
+                    std::min(train_batch_size, n_seq_max),
+                    batch,
+                    loss_targets,
+                    next_si,
+                    packed_samples)) {
+                LOG_ERR("%s: failed to build packed batch at sample %zu\n", __func__, si);
+                break;
             }
 
-            // Per-step independent loss returned by optimizer for this sample.
+            // Per-step independent loss returned by optimizer for this packed batch.
             float sample_loss = optimizer.step(ctx, batch, n_vocab, loss_targets);
 
             epoch_loss_sum += sample_loss;
             n_done++;
+            n_samples_done += packed_samples;
 
             // Show current step loss (not running average).
             progress_callback(true, n_done, iters_per_epoch,
                 sample_loss, t_epoch_start, cpu_tracker);
 
             llama_batch_free(batch);
+            si = next_si;
         }
 
         fprintf(stderr, "\n");
-        LOG_INF("%s: Epoch %d complete - Avg Loss: %.6f, samples=%ld\n",
-                __func__, epoch + 1, n_done > 0 ? epoch_loss_sum / n_done : 0.0f, n_done);
+        LOG_INF("%s: Epoch %d complete - Avg Loss: %.6f, batches=%ld, samples=%ld\n",
+                __func__, epoch + 1, n_done > 0 ? epoch_loss_sum / n_done : 0.0f, n_done, n_samples_done);
         if (!eval_samples.empty()) {
             const float acc = evaluate_sst2_accuracy(ctx, eval_samples, n_ctx);
             LOG_INF("%s: Epoch %d validation accuracy: %.2f%%\n", __func__, epoch + 1, acc * 100.0f);
@@ -808,6 +933,28 @@ int main(int argc, char ** argv) {
                 save_lora_only = true;
                 continue;
             }
+            if (std::strcmp(argv[i], "--train-batch-size") == 0 && i + 1 < argc) {
+                int32_t parsed = 0;
+                if (parse_int32_arg(argv[i + 1], parsed) && parsed > 0) {
+                    train_config.train_batch_size = parsed;
+                } else {
+                    LOG_WRN("%s: invalid --train-batch-size value '%s', keeping %d\n",
+                            __func__, argv[i + 1], train_config.train_batch_size);
+                }
+                ++i;
+                continue;
+            }
+            if (std::strncmp(argv[i], "--train-batch-size=", 19) == 0) {
+                int32_t parsed = 0;
+                const char * value = argv[i] + 19;
+                if (parse_int32_arg(value, parsed) && parsed > 0) {
+                    train_config.train_batch_size = parsed;
+                } else {
+                    LOG_WRN("%s: invalid --train-batch-size value '%s', keeping %d\n",
+                            __func__, value, train_config.train_batch_size);
+                }
+                continue;
+            }
             argv[n++] = argv[i];
         }
         argc = n;
@@ -818,9 +965,27 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // Each sample is processed independently as a single-sequence batch,
-    // so n_parallel=1 (the default) is correct and avoids the slow multi-seq
-    // decode path in llama.cpp.
+    // Packed SST-2 training uses multiple independent seq_id streams inside one
+    // llama_batch, so the context must allow at least train_batch_size sequences.
+    {
+        const int32_t effective_parallel = std::max<int32_t>(1, train_config.train_batch_size);
+        const int32_t per_seq_ctx_target = std::min<int32_t>(
+                std::max<int32_t>(2, train_config.max_tokens_per_sample),
+                std::max<int32_t>(2, params.n_ctx));
+        params.n_parallel = std::max<int32_t>(params.n_parallel, effective_parallel);
+        const int32_t packed_token_budget = params.n_parallel * per_seq_ctx_target;
+        params.n_ctx = std::max<int32_t>(params.n_ctx, packed_token_budget);
+        params.n_batch = std::max<int32_t>(params.n_batch, packed_token_budget);
+        params.n_ubatch = std::max<int32_t>(params.n_ubatch, packed_token_budget);
+
+        LOG_INF("%s: packed training config -> train_batch_size=%d, n_parallel=%d, n_ctx=%d, n_batch=%d, n_ubatch=%d\n",
+                __func__,
+                train_config.train_batch_size,
+                params.n_parallel,
+                params.n_ctx,
+                params.n_batch,
+                params.n_ubatch);
+    }
 
     // Reset memory profiling log file as early as possible so startup baselines are kept.
     if (k_enable_memory_logging) {
@@ -930,6 +1095,12 @@ int main(int argc, char ** argv) {
             count_total_tokens(train_set),
             eval_set.size(),
             count_total_tokens(eval_set));
+    LOG_INF("%s: runtime batching -> train_batch_size=%d, ctx_n_seq_max=%u, ctx_n_batch=%u, ctx_n_ctx=%u\n\n",
+            __func__,
+            train_config.train_batch_size,
+            llama_n_seq_max(ctx.get()),
+            llama_n_batch(ctx.get()),
+            llama_n_ctx(ctx.get()));
 
     // *** SETUP LoRA + R-AdaZO OPTIMIZER ***
     lora_config lora_cfg;
@@ -980,7 +1151,7 @@ int main(int argc, char ** argv) {
 
     // Run fine-tuning
     int n_epochs = parse_epochs_from_argv(argc, argv, 1);
-    finetune_radazo_quant(ctx.get(), train_set, eval_set, optimizer, lora_adapter, n_epochs);
+    finetune_radazo_quant(ctx.get(), train_set, eval_set, optimizer, lora_adapter, n_epochs, train_config.train_batch_size);
 
     // Post-training check: inspect logits on one memorized train sample
     // before saving, to verify train-time behavior inside this process.
@@ -1032,6 +1203,8 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: Loaded train examples: %zu\n", __func__, sst2_train_examples.size());
     LOG_INF("%s: Loaded validation examples: %zu\n", __func__, sst2_validation_examples.size());
     LOG_INF("%s: Epochs: %d\n", __func__, n_epochs);
+    LOG_INF("%s: Train batch size: %d\n", __func__, train_config.train_batch_size);
+    LOG_INF("%s: Context parallel slots: %u\n", __func__, llama_n_seq_max(ctx.get()));
     LOG_INF("%s: Training samples: %zu\n", __func__, train_set.size());
     LOG_INF("%s: Training tokens: %zu\n", __func__, count_total_tokens(train_set));
     LOG_INF("%s: Output model: %s\n", __func__, output_file.c_str());
@@ -1039,10 +1212,12 @@ int main(int argc, char ** argv) {
     LOG_INF("%s:   1. Native llama_adapter_lora registered at startup\n", __func__);
     LOG_INF("%s:   2. Base GGUF tensors are read-only throughout training\n", __func__);
     LOG_INF("%s:   3. llama_decode() auto-computes Y = W_base*X + (a/r)*B*A*X\n", __func__);
-    LOG_INF("%s:   4. Global SPSA: ALL LoRA A/B perturbed simultaneously\n", __func__);
-    LOG_INF("%s:      → 2 forward passes per sample (constant, not per-param)\n", __func__);
-    LOG_INF("%s:   5. Adam update applied to all LoRA A/B in one step\n", __func__);
-    LOG_INF("%s:   6. Final GGUF saved by merging trained LoRA into base once\n", __func__);
+    LOG_INF("%s:   4. Samples are packed into one llama_batch with distinct seq_id values\n", __func__);
+    LOG_INF("%s:      → sparse logits only at each sample's target position\n", __func__);
+    LOG_INF("%s:   5. Global SPSA perturbs ALL LoRA A/B once per packed batch\n", __func__);
+    LOG_INF("%s:      → 2 forward passes per update step (constant, not per-param)\n", __func__);
+    LOG_INF("%s:   6. Adam update applied to all LoRA A/B in one step\n", __func__);
+    LOG_INF("%s:   7. Final GGUF saved by merging trained LoRA into base once\n", __func__);
 
     llama_backend_free();
 

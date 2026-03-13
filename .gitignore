@@ -152,3 +152,5 @@ poetry.toml
 # IDE
 *.code-workspace
 .windsurf/
+examples/zeroth-order-opt/drop_train.json
+examples/zeroth-order-opt/drop_train.json

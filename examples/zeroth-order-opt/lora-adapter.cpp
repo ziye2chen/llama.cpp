@@ -9,6 +9,7 @@
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
 #include "gguf.h"
+#include "quant-gguf-support.h"
 
 #include <cmath>
 #include <algorithm>
@@ -338,6 +339,7 @@ bool LoRAAdapter::merge_and_save(
         build_lora_delta(layer, a_data, b_data, delta);
 
         const enum ggml_type qtype = base->type;
+        const char * quant_name = radazo_quant_support::display_quant_type_name(qtype);
 
         if (ggml_is_quantized(qtype)) {
             // ---- Phase 1: Double Quantization Loss diagnostic probes ----
@@ -349,8 +351,8 @@ bool LoRAAdapter::merge_and_save(
                 delta_sum_abs += (double)a;
             }
             const float delta_mean_abs = (float)(delta_sum_abs / (delta.empty() ? 1 : delta.size()));
-            LOG_INF("%s: [Probe A] %s delta: max_abs=%.6e mean_abs=%.6e (ZO updates may be below Q4 bucket size)\n",
-                    __func__, layer.name.c_str(), delta_max_abs, delta_mean_abs);
+            LOG_INF("%s: [Probe A] %s delta for %s: max_abs=%.6e mean_abs=%.6e (requant rounding may suppress small updates)\n",
+                    __func__, layer.name.c_str(), quant_name, delta_max_abs, delta_mean_abs);
         }
 
         if (!ggml_is_quantized(qtype)) {
@@ -367,11 +369,20 @@ bool LoRAAdapter::merge_and_save(
         }
 
         // Quantised path: dequantise → add delta → requantise
+        const bool verified_quant_type = radazo_quant_support::is_verified_quant_type(qtype);
         const struct ggml_type_traits * traits = ggml_get_type_traits(qtype);
         if (!traits || !traits->to_float || !traits->from_float_ref) {
-            LOG_WRN("%s: skip %s (no dequant/quant for %s)\n",
-                    __func__, layer.name.c_str(), ggml_type_name(qtype));
-            continue;
+            LOG_ERR("%s: unsupported quantized tensor %s: type %s has no dequant/requant traits\n",
+                    __func__, layer.name.c_str(), quant_name);
+            return false;
+        }
+
+        if (verified_quant_type) {
+            LOG_INF("%s: merging %s using verified quant format %s\n",
+                    __func__, layer.name.c_str(), quant_name);
+        } else {
+            LOG_WRN("%s: quant format %s is not in the verified support set; attempting generic traits-driven merge for %s\n",
+                    __func__, quant_name, layer.name.c_str());
         }
 
         const int64_t nrows     = ggml_nrows(base);
@@ -393,7 +404,7 @@ bool LoRAAdapter::merge_and_save(
             traits->to_float(quant_row, row_f32.data(), n_per_row);
 
             if (ir < probe_b_rows) {
-                LOG_INF("%s: [Probe B] %s row %ld BEFORE+delta: first 10 fp32 = ", __func__, layer.name.c_str(), ir);
+                LOG_INF("%s: [Probe B] %s row %ld BEFORE+delta (%s): first 10 fp32 = ", __func__, layer.name.c_str(), ir, quant_name);
                 for (int64_t ic = 0; ic < std::min(10L, n_per_row); ++ic) {
                     fprintf(stderr, "%.6e ", row_f32[(size_t)ic]);
                 }
@@ -405,7 +416,7 @@ bool LoRAAdapter::merge_and_save(
             }
 
             if (ir < probe_b_rows) {
-                LOG_INF("%s: [Probe B] %s row %ld AFTER+delta: first 10 fp32 = ", __func__, layer.name.c_str(), ir);
+                LOG_INF("%s: [Probe B] %s row %ld AFTER+delta (%s): first 10 fp32 = ", __func__, layer.name.c_str(), ir, quant_name);
                 for (int64_t ic = 0; ic < std::min(10L, n_per_row); ++ic) {
                     fprintf(stderr, "%.6e ", row_f32[(size_t)ic]);
                 }
@@ -419,14 +430,14 @@ bool LoRAAdapter::merge_and_save(
             }
         }
 
-        LOG_INF("%s: [Probe C] %s: %ld/%ld rows changed after requant (0%% = all wiped by rounding)\n",
-                __func__, layer.name.c_str(), n_blocks_changed, nrows);
+        LOG_INF("%s: [Probe C] %s (%s): %ld/%ld rows changed after requant (0%% = all updates rounded away)\n",
+                __func__, layer.name.c_str(), quant_name, n_blocks_changed, nrows);
 
         ggml_backend_tensor_set(base, quant_data.data(), 0, nbytes);
         llama_synchronize(ctx_);
         LOG_INF("%s: merged %s ([%ld,%ld] type %s)\n",
                 __func__, layer.name.c_str(), layer.out_dim, layer.in_dim,
-                ggml_type_name(qtype));
+                quant_name);
     }
 
     LOG_INF("%s: saving merged model to %s\n", __func__, output_path.c_str());

@@ -7,6 +7,7 @@
 //   ./llama-perplexity -m model.gguf -f wiki.test.raw
 //   ./llama-perplexity -m model_modified.gguf -f wiki.test.raw
 // Compare perplexity - modified model should differ.
+// Verified quantized GGUF support includes Q4_K_M, Q5_0, Q5_K_M, and Q6_K.
 
 #include "arg.h"
 #include "common.h"
@@ -14,6 +15,7 @@
 #include "llama.h"
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "quant-gguf-support.h"
 
 #include <cmath>
 #include <cstdio>
@@ -56,6 +58,19 @@ static bool requantize_to_bytes(struct ggml_tensor * t, const std::vector<float>
         traits->from_float_ref(fp32.data() + r * n_per_row, quant.data() + r * row_size, n_per_row);
     }
     return true;
+}
+
+static void log_quant_support_status(enum ggml_type qtype, const char * tensor_name) {
+    const char * quant_name = radazo_quant_support::display_quant_type_name(qtype);
+    if (radazo_quant_support::is_verified_quant_type(qtype)) {
+        LOG_INF("%s: tensor %s uses verified quant format %s\n", __func__, tensor_name, quant_name);
+    } else if (radazo_quant_support::has_requant_traits(qtype)) {
+        LOG_WRN("%s: tensor %s uses quant format %s outside the verified set; proceeding with generic traits-driven verification\n",
+                __func__, tensor_name, quant_name);
+    } else {
+        LOG_ERR("%s: tensor %s uses quant format %s without dequant/requant traits\n",
+                __func__, tensor_name, quant_name);
+    }
 }
 
 int main(int argc, char ** argv) {
@@ -108,18 +123,27 @@ int main(int argc, char ** argv) {
     }
 
     LOG_INF("%s: Modifying tensor: %s (shape [%ld,%ld], type %s)\n", __func__,
-           target->name, target->ne[0], target->ne[1], ggml_type_name(target->type));
+           target->name, target->ne[0], target->ne[1],
+           radazo_quant_support::display_quant_type_name(target->type));
 
     const float perturbation = 1e-3f;  // Small but visible change
 
     if (ggml_is_quantized(target->type)) {
+        log_quant_support_status(target->type, target->name);
+        if (!radazo_quant_support::has_requant_traits(target->type)) {
+            LOG_ERR("%s: quantized tensor type %s cannot be dequantized/requantized by ggml\n",
+                    __func__, radazo_quant_support::display_quant_type_name(target->type));
+            return 1;
+        }
+
         std::vector<uint8_t> quant(ggml_nbytes(target));
         ggml_backend_tensor_get(target, quant.data(), 0, quant.size());
         llama_synchronize(init.context.get());
 
         std::vector<float> fp32;
         if (!dequantize_to_fp32(target, quant, fp32)) {
-            LOG_ERR("%s: dequantize failed\n", __func__);
+            LOG_ERR("%s: dequantize failed for %s\n", __func__,
+                    radazo_quant_support::display_quant_type_name(target->type));
             return 1;
         }
 
@@ -130,7 +154,8 @@ int main(int argc, char ** argv) {
 
         std::vector<uint8_t> quant_new;
         if (!requantize_to_bytes(target, fp32, quant_new)) {
-            LOG_ERR("%s: requantize failed\n", __func__);
+            LOG_ERR("%s: requantize failed for %s\n", __func__,
+                    radazo_quant_support::display_quant_type_name(target->type));
             return 1;
         }
 

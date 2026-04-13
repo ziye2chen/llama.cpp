@@ -559,7 +559,7 @@ After 500 iterations: w = 2.487, b = 1.319, loss = 0.012
 ### Advanced Features
 
 1. **LoRA Integration**: Apply zeroth-order updates to LoRA adapters
-2. **Quantization-Aware**: Fine-tune quantized models directly
+2. **Quantization-Aware**: Fine-tune quantized models directly; verified GGUF support includes `Q4_K_M`, `Q5_0`, `Q5_K_M`, and `Q6_K`, while the merge/save path remains extensible through generic ggml dequant/requant traits
 3. **Multi-Objective**: Optimize for multiple losses simultaneously
 4. **Evolutionary Methods**: Combine with genetic algorithms or ES
 

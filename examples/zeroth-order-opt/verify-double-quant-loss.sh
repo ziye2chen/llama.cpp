@@ -45,7 +45,7 @@ echo "Fine-tuned: $HASH_FINE"
 if [[ "$HASH_BASE" == "$HASH_FINE" ]]; then
     echo ""
     echo "*** RESULT: Hashes IDENTICAL -> Double Quantization Loss CONFIRMED ***"
-    echo "All weight updates were wiped by Q4_K_M requantization."
+    echo "All weight updates were wiped by requantization for this quantized GGUF format."
 else
     echo ""
     echo "Hashes differ. Computing binary diff..."

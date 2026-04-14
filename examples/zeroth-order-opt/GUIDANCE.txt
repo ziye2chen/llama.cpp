@@ -61,6 +61,10 @@ cmake --build . --config Debug --target finetune-radazo-quant
 
 /home/xplor/.cache/huggingface/hub/models--Qwen--Qwen3-8B-GGUF/snapshots/7c41481f57cb95916b40956ab2f0b139b296d974/Qwen3-8B-Q4_K_M.gguf
 
+# Verified quantized GGUF support currently includes Q4_K_M, Q5_0, Q5_K_M, and Q6_K.
+# The command flow below is unchanged across those formats; only the ggml
+# dequant/requant details differ by quant type.
+
 ./bin/finetune-radazo-quant   -m /home/xplor/.cache/huggingface/hub/models--Qwen--Qwen3-8B-GGUF/snapshots/7c41481f57cb95916b40956ab2f0b139b296d974/Qwen3-8B-Q4_K_M.gguf   -f /home/xplor/llama.cpp/examples/zeroth-order-opt/gsm8k_test.jsonl   -o /home/xplor/llama.cpp/Qwen3_Q4_K_M_finetuned.gguf  --epochs 1
 
 # Verify parameter update (test that tensor modifications persist to saved GGUF):

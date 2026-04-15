@@ -11,11 +11,12 @@ struct verified_quant_type {
     const char * label;
 };
 
-inline constexpr std::array<verified_quant_type, 4> k_verified_quant_types = {{
+inline constexpr std::array<verified_quant_type, 5> k_verified_quant_types = {{
     { GGML_TYPE_Q4_K, "Q4_K_M" },
     { GGML_TYPE_Q5_0, "Q5_0" },
     { GGML_TYPE_Q5_K, "Q5_K_M" },
     { GGML_TYPE_Q6_K, "Q6_K" },
+    { GGML_TYPE_Q8_0, "Q8_0" },
 }};
 
 inline bool is_verified_quant_type(ggml_type type) {

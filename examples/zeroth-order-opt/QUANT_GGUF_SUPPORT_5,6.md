@@ -8,6 +8,7 @@ This update extends the verified quantized GGUF support in the RAdaZO quantized 
 - `Q5_0`
 - `Q5_K_M`
 - `Q6_K`
+- `Q8_0`
 
 The core algorithm was intentionally **not changed**.
 
@@ -42,6 +43,7 @@ Verified support set:
 - `GGML_TYPE_Q5_0` -> `Q5_0`
 - `GGML_TYPE_Q5_K` -> `Q5_K_M`
 - `GGML_TYPE_Q6_K` -> `Q6_K`
+- `GGML_TYPE_Q8_0` -> `Q8_0`
 
 This keeps the implementation extensible:
 
@@ -123,6 +125,7 @@ Changes:
   - `Q5_0`
   - `Q5_K_M`
   - `Q6_K`
+- `Q8_0`
 - wording was generalized so diagnostics no longer imply only `Q4_K_M` is supported
 - example command flow remains unchanged
 
@@ -173,6 +176,7 @@ For each model format:
 - `Q5_0`
 - `Q5_K_M`
 - `Q6_K`
+- `Q8_0`
 
 run:
 

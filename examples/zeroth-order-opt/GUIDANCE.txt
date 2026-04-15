@@ -61,7 +61,7 @@ cmake --build . --config Debug --target finetune-radazo-quant
 
 /home/xplor/.cache/huggingface/hub/models--Qwen--Qwen3-8B-GGUF/snapshots/7c41481f57cb95916b40956ab2f0b139b296d974/Qwen3-8B-Q4_K_M.gguf
 
-# Verified quantized GGUF support currently includes Q4_K_M, Q5_0, Q5_K_M, and Q6_K.
+# Verified quantized GGUF support currently includes Q4_K_M, Q5_0, Q5_K_M, Q6_K, and Q8_0.
 # The command flow below is unchanged across those formats; only the ggml
 # dequant/requant details differ by quant type.
 

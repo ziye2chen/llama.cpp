@@ -2,10 +2,11 @@
 #
 # Qwen3-8B 批量量化格式测试脚本
 #
-# 这个脚本专门用于批量测试以下 3 个量化 GGUF：
+# 这个脚本专门用于批量测试以下 4 个量化 GGUF：
 #   - Q5_0
 #   - Q5_K_M
 #   - Q6_K
+#   - Q8_0
 #
 # 它会依次调用已经写好的通用测试脚本：
 #   examples/zeroth-order-opt/test_quant_gguf_support.sh
@@ -26,6 +27,7 @@
 #   Qwen3-8B-Q5_0.gguf
 #   Qwen3-8B-Q5_K_M.gguf
 #   Qwen3-8B-Q6_K.gguf
+#   Qwen3-8B-Q8_0.gguf
 #
 set -euo pipefail
 
@@ -139,7 +141,7 @@ mkdir -p "$OUTPUT_ROOT"
 BATCH_SUMMARY="$OUTPUT_ROOT/batch_summary.txt"
 
 # 这里只测你要求的三个量化格式，不测 Q4_K_M。
-QUANTS=(Q5_0 Q5_K_M Q6_K)
+QUANTS=(Q5_0 Q5_K_M Q6_K Q8_0)
 
 {
     echo "==== Qwen3-8B 批量量化测试 ===="

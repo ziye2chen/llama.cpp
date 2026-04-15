@@ -7,7 +7,7 @@
 //   ./llama-perplexity -m model.gguf -f wiki.test.raw
 //   ./llama-perplexity -m model_modified.gguf -f wiki.test.raw
 // Compare perplexity - modified model should differ.
-// Verified quantized GGUF support includes Q4_K_M, Q5_0, Q5_K_M, and Q6_K.
+// Verified quantized GGUF support includes Q4_K_M, Q5_0, Q5_K_M, Q6_K, and Q8_0.
 
 #include "arg.h"
 #include "common.h"

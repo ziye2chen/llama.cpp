@@ -147,7 +147,7 @@ Output model: output.gguf
 - Extremely memory-constrained environments
 - Research into gradient-free methods
 - Small models with few parameters
-- Fine-tuning quantized models directly; verified GGUF support includes `Q4_K_M`, `Q5_0`, `Q5_K_M`, and `Q6_K`, with the same core flow and only quant-format-specific dequant/requant differences
+- Fine-tuning quantized models directly; verified GGUF support includes `Q4_K_M`, `Q5_0`, `Q5_K_M`, `Q6_K`, and `Q8_0`, with the same core flow and only quant-format-specific dequant/requant differences
 
 ### ❌ Not Recommended
 - Standard fine-tuning tasks

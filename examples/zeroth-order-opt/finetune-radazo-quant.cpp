@@ -2,7 +2,7 @@
 // Direct quantized tensor modification: dequantize -> perturb -> requantize -> forward
 // Same approach as FP32 fine-tuning (finetune-radazo.cpp) but the optimizer
 // transparently handles quantized types via dequant/requant wrappers.
-// Verified quantized GGUF support includes Q4_K_M, Q5_0, Q5_K_M, and Q6_K.
+// Verified quantized GGUF support includes Q4_K_M, Q5_0, Q5_K_M, Q6_K, and Q8_0.
 
 #include "arg.h"
 #include "common.h"
@@ -1045,7 +1045,7 @@ int main(int argc, char ** argv) {
                 __func__, n_quant, n_fp32);
         if (n_quant > 0) {
             LOG_INF("%s: Quantized model detected - using dequant/requant for parameter updates\n", __func__);
-            LOG_INF("%s: Verified quantized GGUF support: Q4_K_M, Q5_0, Q5_K_M, Q6_K\n", __func__);
+            LOG_INF("%s: Verified quantized GGUF support: Q4_K_M, Q5_0, Q5_K_M, Q6_K, Q8_0\n", __func__);
             LOG_INF("%s: Other quantized formats keep the same merge/save flow but rely on generic ggml dequant/requant traits\n", __func__);
         }
     }
@@ -1211,7 +1211,7 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: Training samples: %zu\n", __func__, train_set.size());
     LOG_INF("%s: Training tokens: %zu\n", __func__, count_total_tokens(train_set));
     LOG_INF("%s: Output model: %s\n", __func__, output_file.c_str());
-    LOG_INF("%s: Verified quantized GGUF support: Q4_K_M, Q5_0, Q5_K_M, Q6_K\n", __func__);
+    LOG_INF("%s: Verified quantized GGUF support: Q4_K_M, Q5_0, Q5_K_M, Q6_K, Q8_0\n", __func__);
     LOG_INF("\n%s: How it works (Global-SPSA QLoRA on quantized models):\n", __func__);
     LOG_INF("%s:   1. Native llama_adapter_lora registered at startup\n", __func__);
     LOG_INF("%s:   2. Base GGUF tensors are read-only throughout training\n", __func__);
